@@ -15,7 +15,7 @@ if [[ -f "$PID_FILE" ]]; then
 fi
 
 cd "$SRC_DIR"
-nohup bash -lc "exec -a pm-agent-plus env PYTHONPATH=. python3.11 main.py" >>"$LOG_FILE" 2>&1 &
+nohup bash -lc "exec -a pm-agent-plus env PYTHONPATH=. python3 main.py" >>"$LOG_FILE" 2>&1 &
 NEW_PID=$!
 echo "$NEW_PID" >"$PID_FILE"
 echo "started pm-agent-plus (pid=$NEW_PID), log=$LOG_FILE"

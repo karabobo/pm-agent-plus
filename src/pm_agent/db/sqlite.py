@@ -555,3 +555,30 @@ class SQLiteDB:
                 position_value=new_pos,
                 cash_balance=new_cash,
             )
+
+    def count_todays_trades(self, model_id: str = "default") -> int:
+        """Count BUY trades executed today (UTC date) for the given model.
+
+        Used by ExecutionEngine to enforce max_daily_trades limits.
+        Only counts BUY-side trades (opening new positions) so that
+        close/sell actions are never blocked by the daily cap.
+        """
+        import datetime as _dt
+
+        today = _dt.date.today().isoformat()  # e.g. "2026-02-23"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM trades
+                WHERE model_id = ?
+                  AND UPPER(side) LIKE 'BUY%'
+                  AND ts >= ?
+                """,
+                (model_id, today),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+        finally:
+            conn.close()
+

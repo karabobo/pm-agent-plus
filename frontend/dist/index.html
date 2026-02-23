@@ -28,20 +28,35 @@
         <div class="status-chip" id="status-chip">Syncing</div>
       </header>
 
-      <section class="panel">
-        <h2>Market Snapshot</h2>
-        <div id="market-grid" class="market-grid"></div>
-      </section>
+      <div class="main-layout">
+        <aside class="left-pane">
+          <section class="panel">
+            <h2>Market Snapshot</h2>
+            <div id="market-grid" class="market-grid"></div>
+          </section>
 
-      <section class="panel">
-        <h2>Model Performance (Top 5)</h2>
-        <div id="models-grid" class="models-grid"></div>
-      </section>
+          <section class="panel leaderboard-panel">
+            <h2>Leaderboard</h2>
+            <div id="models-grid" class="models-grid"></div>
+          </section>
+        </aside>
 
-      <section class="panel">
-        <h2>Latest Decisions (All Models)</h2>
-        <div id="decisions-grid" class="decisions-grid"></div>
-      </section>
+        <section class="right-pane panel live-panel">
+          <div class="live-header">
+            <div class="live-title-flex">
+              <span class="live-indicator"></span>
+              <h2>LIVE ModelChat</h2>
+            </div>
+            <div class="live-filter">
+              <label for="model-filter">FILTER:</label>
+              <select id="model-filter">
+                <option value="ALL">ALL MODELS</option>
+              </select>
+            </div>
+          </div>
+          <div id="live-chat-grid" class="live-chat-grid"></div>
+        </section>
+      </div>
     </main>
   </body>
 </html>

@@ -134,20 +134,13 @@ def mfi(
 ) -> pd.Series:
     typical_price = (high + low + close) / 3
     money_flow = typical_price * volume
-    positive_flow = pd.Series(0.0, index=close.index)
-    negative_flow = pd.Series(0.0, index=close.index)
-
-    for i in range(1, len(typical_price)):
-        if typical_price.iloc[i] > typical_price.iloc[i - 1]:
-            positive_flow.iloc[i] = money_flow.iloc[i]
-        elif typical_price.iloc[i] < typical_price.iloc[i - 1]:
-            negative_flow.iloc[i] = money_flow.iloc[i]
-
+    direction = typical_price.diff()
+    positive_flow = money_flow.where(direction > 0, 0.0)
+    negative_flow = money_flow.where(direction < 0, 0.0)
     positive_mf = positive_flow.rolling(period).sum()
     negative_mf = negative_flow.rolling(period).sum()
     mfr = positive_mf / negative_mf.replace(0, np.nan)
-    mfi_value = 100 - 100 / (1 + mfr)
-    return mfi_value.fillna(50)
+    return (100 - 100 / (1 + mfr)).fillna(50)
 
 
 def kdj(

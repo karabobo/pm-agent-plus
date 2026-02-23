@@ -3,12 +3,13 @@
 
   const API_BASE = "/api";
   const REFRESH_MS = 5000;
-  const MAX_MODELS = 5;
+  const MAX_MODELS = 8; // expand to 8 models
 
   const el = {
     market: document.getElementById("market-grid"),
     models: document.getElementById("models-grid"),
-    decisions: document.getElementById("decisions-grid"),
+    chat: document.getElementById("live-chat-grid"),
+    filter: document.getElementById("model-filter"),
     refresh: document.getElementById("last-refresh"),
     status: document.getElementById("status-chip"),
   };
@@ -16,9 +17,19 @@
   const state = {
     market: null,
     models: [],
+    events: [], // grouped by cycle_id across all models
+    selectedModelId: "ALL",
     lastFetchMs: 0,
     error: null,
   };
+
+  // Setup Event Listeners
+  if (el.filter) {
+    el.filter.addEventListener("change", (e) => {
+      state.selectedModelId = e.target.value;
+      renderChat();
+    });
+  }
 
   const providerMeta = {
     gemini: { icon: "/logos/gemini.svg", label: "Gemini" },
@@ -26,6 +37,9 @@
     claude: { icon: "/logos/cluade.png", label: "Claude" },
     qwen: { icon: "/logos/qwen.svg", label: "Qwen" },
     deepseek: { icon: "/logos/deepseek.svg", label: "DeepSeek" },
+    grok: { icon: "✖", label: "Grok" },
+    glm: { icon: "智", label: "GLM" },
+    custom: { icon: "⚙", label: "Custom" },
   };
 
   function toNum(value) {
@@ -58,6 +72,7 @@
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
       hour12: false,
     });
   }
@@ -66,7 +81,7 @@
     if (!tsMs) return "No recent activity";
     const diff = Math.max(0, Date.now() - tsMs);
     const mins = Math.floor(diff / 60000);
-    if (mins < 1) return "just now";
+    if (mins < 1) return Math.floor(diff / 1000) + "s ago";
     if (mins < 60) return `${mins}m ago`;
     const hrs = Math.floor(mins / 60);
     if (hrs < 24) return `${hrs}h ago`;
@@ -78,7 +93,7 @@
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
-      .replace(/\"/g, "&quot;")
+      .replace(/"/g, "&quot;")
       .replace(/'/g, "&#039;");
   }
 
@@ -110,24 +125,12 @@
     const raw = (modelId || "").toLowerCase();
     const provider = raw.split("-")[0] || raw;
     const meta = providerMeta[provider];
-    if (!meta) {
-      return { icon: "🧠", label: modelId || "Unknown" };
-    }
+    if (!meta) return { icon: "🧠", label: modelId || "Unknown" };
     const modelName = raw.slice(provider.length + 1);
     return {
       icon: meta.icon,
       label: modelName ? `${meta.label} (${modelName})` : meta.label,
     };
-  }
-
-  function uniqueModels(models) {
-    const seen = new Set();
-    return (models || []).filter((m) => {
-      if (!m || m === "default") return false;
-      if (seen.has(m)) return false;
-      seen.add(m);
-      return true;
-    });
   }
 
   function bestMark(sideQuote) {
@@ -145,17 +148,9 @@
     const tracked = {};
     if (upId) tracked[upId] = { shares: 0, avgCost: 0, direction: "UP" };
     if (downId) tracked[downId] = { shares: 0, avgCost: 0, direction: "DOWN" };
+    if (!upId && !downId) return { rows: [], positionValue: 0, unrealizedPnl: 0 };
 
-    if (!upId && !downId) {
-      return { rows: [], positionValue: 0, unrealizedPnl: 0 };
-    }
-
-    const ordered = [...(trades || [])].sort((a, b) => {
-      const ida = Number(a?.id) || 0;
-      const idb = Number(b?.id) || 0;
-      if (ida !== idb) return ida - idb;
-      return parseTs(a?.ts) - parseTs(b?.ts);
-    });
+    const ordered = [...(trades || [])].sort((a, b) => parseTs(a?.ts) - parseTs(b?.ts));
 
     for (const trade of ordered) {
       const tokenId = trade?.token_id;
@@ -182,7 +177,6 @@
 
     const upMark = bestMark(market?.up);
     const downMark = bestMark(market?.down);
-
     const rows = [];
     let positionValue = 0;
     let unrealizedPnl = 0;
@@ -209,42 +203,6 @@
     return { rows, positionValue, unrealizedPnl };
   }
 
-  function extractLatestDecision(decisions) {
-    const events = Array.isArray(decisions?.events) ? decisions.events : [];
-    const decisionEvent = events.find((ev) => ev?.type === "ai_decision" || ev?.type === "decision");
-    const runEndEvent = events.find((ev) => ev?.type === "run_end");
-
-    const payload = decisionEvent?.payload || decisions?.last_round_ai_thinking || null;
-    let actions = [];
-
-    if (Array.isArray(payload?.decision?.actions)) {
-      actions = payload.decision.actions;
-    } else if (Array.isArray(payload?.actions)) {
-      actions = payload.actions;
-    } else if (Array.isArray(runEndEvent?.payload?.results)) {
-      actions = runEndEvent.payload.results
-        .map((r) => r?.action)
-        .filter((a) => a && typeof a === "object");
-    }
-
-    const reasoning =
-      payload?.reasoning ||
-      runEndEvent?.payload?.results?.[0]?.action?.rationale ||
-      "";
-
-    const ts = decisionEvent?.ts || runEndEvent?.ts || null;
-    return { actions, reasoning, ts };
-  }
-
-  function maxTsFromArray(items, key = "ts") {
-    let max = 0;
-    for (const item of items || []) {
-      const ts = parseTs(item?.[key]);
-      if (ts > max) max = ts;
-    }
-    return max;
-  }
-
   async function loadModel(modelId, market) {
     const [stats, decisions, trades] = await Promise.all([
       fetchJson(`/stats?model_id=${encodeURIComponent(modelId)}`),
@@ -254,32 +212,18 @@
 
     const latestEquity = stats?.latest_equity || null;
     const profit = stats?.profit || {};
-
     const positionCalc = calcCurrentMarketPositions(trades?.trades || [], market);
-    const latestDecision = extractLatestDecision(decisions);
 
-    const realized =
-      toNum(latestEquity?.realized_pnl) ??
-      toNum(profit?.realized_pnl) ??
-      0;
-
-    const unrealized =
-      toNum(latestEquity?.unrealized_pnl) ??
-      toNum(positionCalc.unrealizedPnl) ??
-      0;
-
-    const positionValue =
-      toNum(latestEquity?.position_value) ??
-      toNum(positionCalc.positionValue) ??
-      0;
-
+    const realized = toNum(latestEquity?.realized_pnl) ?? toNum(profit?.realized_pnl) ?? 0;
+    const unrealized = toNum(latestEquity?.unrealized_pnl) ?? toNum(positionCalc.unrealizedPnl) ?? 0;
+    const positionValue = toNum(latestEquity?.position_value) ?? toNum(positionCalc.positionValue) ?? 0;
     const totalEquity = toNum(latestEquity?.total_equity);
     const cashBalance = toNum(latestEquity?.cash_balance);
 
     const lastActivityTs = Math.max(
       parseTs(latestEquity?.ts),
-      maxTsFromArray(decisions?.events || []),
-      maxTsFromArray(trades?.trades || [])
+      ...((decisions?.events || []).map(e => parseTs(e.ts))),
+      ...((trades?.trades || []).map(t => parseTs(t.ts)))
     );
 
     return {
@@ -293,141 +237,61 @@
       unrealized,
       positionValue,
       tradeCount: Number(profit?.trade_count) || 0,
-      latestDecision,
       lastActivityTs,
+      rawEvents: decisions?.events || []
     };
   }
 
-  function renderMarket() {
-    if (!el.market) return;
+  function groupEvents(allModelsData) {
+    const cycles = {};
+    for (const m of allModelsData) {
+      if (!m || !m.rawEvents) continue;
+      for (const ev of m.rawEvents) {
+        let cycleId = null;
+        if (ev.payload?.cycle_id) cycleId = ev.payload.cycle_id;
+        else if (ev.payload?.system_state?.cycle_id) cycleId = ev.payload.system_state.cycle_id;
 
-    const m = state.market;
-    if (!m) {
-      el.market.innerHTML = `<div class="loading">Loading market snapshot...</div>`;
-      return;
+        if (!cycleId) continue; // fallback: ignore events without cycle
+
+        if (!cycles[cycleId]) {
+          cycles[cycleId] = {
+            cycleId,
+            modelId: m.modelId,
+            ts: 0,
+            prompt: "",
+            rawResp: "",
+            reasoning: "",
+            actions: [],
+            results: []
+          };
+        }
+
+        const t = parseTs(ev.ts);
+        if (t > cycles[cycleId].ts) cycles[cycleId].ts = t;
+
+        if (ev.type === "ai_raw") {
+          if (ev.payload?.prompt) cycles[cycleId].prompt = ev.payload.prompt;
+          if (ev.payload?.raw) cycles[cycleId].rawResp = ev.payload.raw;
+        } else if (ev.type === "ai_decision" || ev.type === "decision") {
+          if (ev.payload?.decision?.actions) cycles[cycleId].actions = ev.payload.decision.actions;
+          else if (ev.payload?.actions) cycles[cycleId].actions = ev.payload.actions;
+
+          if (ev.payload?.reasoning) cycles[cycleId].reasoning = ev.payload.reasoning;
+        } else if (ev.type === "run_end") {
+          if (Array.isArray(ev.payload?.results)) {
+            cycles[cycleId].results = ev.payload.results;
+            if (cycles[cycleId].actions.length === 0) {
+              // extract actions from results if ai_decision skipped storing them directly
+              cycles[cycleId].actions = ev.payload.results.map(r => r.action).filter(Boolean);
+            }
+          }
+        }
+      }
     }
 
-    const current = toNum(m.current_btc_price);
-    const target = toNum(m.price_to_beat);
-    const delta = current !== null && target !== null ? current - target : null;
-
-    const upBid = toNum(m?.up?.bid);
-    const upAsk = toNum(m?.up?.ask);
-    const downBid = toNum(m?.down?.bid);
-    const downAsk = toNum(m?.down?.ask);
-
-    const cells = [
-      {
-        label: "Market",
-        value: escapeHtml(m.market_slug || "--"),
-        cls: "small",
-      },
-      {
-        label: "Ends In",
-        value: `<span id="countdown">--:--</span>`,
-      },
-      {
-        label: "Price To Beat",
-        value: target === null ? "--" : `$${target.toFixed(2)}`,
-      },
-      {
-        label: "BTC Price",
-        value:
-          current === null
-            ? "--"
-            : `$${current.toFixed(2)}${
-                delta === null
-                  ? ""
-                  : ` <span class="${delta >= 0 ? "up" : "down"}">(${delta >= 0 ? "+" : ""}${delta.toFixed(2)})</span>`
-              }`,
-      },
-      {
-        label: "UP Bid / Ask",
-        value: `${upBid === null ? "--" : upBid.toFixed(3)} / ${upAsk === null ? "--" : upAsk.toFixed(3)}`,
-      },
-      {
-        label: "DOWN Bid / Ask",
-        value: `${downBid === null ? "--" : downBid.toFixed(3)} / ${downAsk === null ? "--" : downAsk.toFixed(3)}`,
-      },
-    ];
-
-    el.market.innerHTML = cells
-      .map(
-        (c) => `
-        <div class="market-item">
-          <div class="label">${c.label}</div>
-          <div class="value ${c.cls || ""}">${c.value}</div>
-        </div>
-      `
-      )
-      .join("");
-
-    updateCountdown();
-  }
-
-  function renderModels() {
-    if (!el.models) return;
-
-    if (state.error) {
-      el.models.innerHTML = `<div class="error">${escapeHtml(state.error)}</div>`;
-      return;
-    }
-
-    if (!state.models.length) {
-      el.models.innerHTML = `<div class="loading">No model data yet.</div>`;
-      return;
-    }
-
-    el.models.innerHTML = state.models
-      .map((m) => {
-        const meta = modelMeta(m.modelId);
-        const posHtml = m.positions.length
-          ? m.positions
-              .map((p) => {
-                const cls = p.direction === "UP" ? "up" : "down";
-                const upnl = toNum(p.unrealizedPnl);
-                return `
-                <div class="pos-row">
-                  <div class="pos-head">
-                    <span class="${cls}">${p.direction}</span>
-                    <span>${p.shares.toFixed(3)} shares</span>
-                  </div>
-                  <div class="pos-sub">Avg ${p.avgCost.toFixed(3)} | Mark ${p.mark === null ? "--" : p.mark.toFixed(3)}</div>
-                  <div class="pos-sub">Value ${fmtMoney(p.value)} | U-PnL <span class="${(upnl || 0) >= 0 ? "up" : "down"}">${fmtSigned(upnl)}</span></div>
-                </div>
-              `;
-              })
-              .join("")
-          : `<div class="empty-note">No current market position.</div>`;
-
-        const iconHtml = meta.icon.startsWith("/")
-          ? `<img src="${meta.icon}" alt="${escapeHtml(meta.label)}" />`
-          : `<span class="emoji">${meta.icon}</span>`;
-
-        const eq = m.totalEquity !== null ? fmtMoney(m.totalEquity) : "--";
-        const cash = m.cashBalance !== null ? fmtMoney(m.cashBalance) : "--";
-
-        return `
-          <article class="model-card">
-            <div class="model-header">
-              <div class="model-name">${iconHtml}<span>${escapeHtml(meta.label)}</span></div>
-              <div class="model-time">${escapeHtml(fmtAge(m.lastActivityTs))}<br/>${escapeHtml(fmtShortTime(m.lastActivityTs))}</div>
-            </div>
-
-            <div class="metrics">
-              <div class="metric-line"><span class="k">Total Equity</span><span class="v">${eq}</span></div>
-              <div class="metric-line"><span class="k">Cash</span><span class="v">${cash}</span></div>
-              <div class="metric-line"><span class="k">Position Value</span><span class="v">${fmtMoney(m.positionValue)}</span></div>
-              <div class="metric-line"><span class="k">Unrealized P&L</span><span class="v ${(m.unrealized || 0) >= 0 ? "up" : "down"}">${fmtSigned(m.unrealized)}</span></div>
-              <div class="metric-line"><span class="k">Realized P&L</span><span class="v ${(m.realized || 0) >= 0 ? "up" : "down"}">${fmtSigned(m.realized)}</span></div>
-              <div class="metric-line"><span class="k">Trades</span><span class="v">${m.tradeCount}</span></div>
-            </div>
-
-            <div class="positions">${posHtml}</div>
-          </article>
-        `;
-      })
-      .join("");
+    const arr = Object.values(cycles);
+    arr.sort((a, b) => b.ts - a.ts); // Descending (newest first)
+    return arr;
   }
 
   function actionClass(type) {
@@ -438,75 +302,197 @@
     return "action-wait";
   }
 
-  function renderDecisions() {
-    if (!el.decisions) return;
-
-    if (!state.models.length) {
-      el.decisions.innerHTML = `<div class="loading">No decisions yet.</div>`;
+  function renderMarket() {
+    if (!el.market) return;
+    const m = state.market;
+    if (!m) {
+      el.market.innerHTML = `<div class="loading">Loading market snapshot...</div>`;
       return;
     }
 
-    el.decisions.innerHTML = state.models
-      .map((m) => {
-        const meta = modelMeta(m.modelId);
-        const iconHtml = meta.icon.startsWith("/")
-          ? `<img src="${meta.icon}" alt="${escapeHtml(meta.label)}" />`
-          : `<span class="emoji">${meta.icon}</span>`;
+    const current = toNum(m.current_btc_price);
+    const target = toNum(m.price_to_beat);
+    const delta = current !== null && target !== null ? current - target : null;
+    const upBid = toNum(m?.up?.bid);
+    const upAsk = toNum(m?.up?.ask);
+    const downBid = toNum(m?.down?.bid);
+    const downAsk = toNum(m?.down?.ask);
 
-        const actions = Array.isArray(m.latestDecision.actions) ? m.latestDecision.actions : [];
-        const actionHtml = actions.length
-          ? actions
-              .slice(0, 4)
-              .map((a) => {
-                const type = String(a?.type || "wait").toLowerCase();
-                const side = String(a?.side || "").replace(/_/g, " ");
-                const size = toNum(a?.size);
-                const price = toNum(a?.price);
-                const parts = [type.toUpperCase()];
-                if (side) parts.push(side);
-                if (size !== null && size > 0) parts.push(`${size.toFixed(3)}sh`);
-                if (price !== null && price > 0) parts.push(`@${price.toFixed(3)}`);
-                return `<span class="action-chip ${actionClass(type)}">${escapeHtml(parts.join(" "))}</span>`;
-              })
-              .join("")
-          : `<span class="empty-note">No decision action.</span>`;
+    const cells = [
+      { label: "Market", value: escapeHtml(m.market_slug || "--"), cls: "small" },
+      { label: "Ends In", value: `<span id="countdown">--:--</span>` },
+      { label: "Price To Beat", value: target === null ? "--" : `$${target.toFixed(2)}` },
+      {
+        label: "BTC Price",
+        value: current === null ? "--" : `$${current.toFixed(2)}${delta === null ? "" : ` <span class="${delta >= 0 ? "up" : "down"}">(${delta >= 0 ? "+" : ""}${delta.toFixed(2)})</span>`
+          }`
+      },
+      { label: "UP B/A", value: `${upBid === null ? "--" : upBid.toFixed(3)} / ${upAsk === null ? "--" : upAsk.toFixed(3)}` },
+      { label: "DOWN B/A", value: `${downBid === null ? "--" : downBid.toFixed(3)} / ${downAsk === null ? "--" : downAsk.toFixed(3)}` }
+    ];
 
-        const rationale =
-          actions.find((a) => a?.rationale)?.rationale ||
-          m.latestDecision.reasoning ||
-          "No rationale yet.";
+    el.market.innerHTML = cells.map(c => `
+      <div class="market-item">
+        <div class="label">${c.label}</div>
+        <div class="value ${c.cls || ""}">${c.value}</div>
+      </div>
+    `).join("");
 
-        const reasoning = m.latestDecision.reasoning || "";
+    updateCountdown();
+  }
 
-        return `
-          <article class="decision-card">
-            <div class="model-header">
-              <div class="model-name">${iconHtml}<span>${escapeHtml(meta.label)}</span></div>
-              <div class="model-time">${escapeHtml(fmtAge(parseTs(m.latestDecision.ts) || m.lastActivityTs))}</div>
+  function renderLeaderboard() {
+    if (!el.models) return;
+    if (state.error) {
+      el.models.innerHTML = `<div class="error">${escapeHtml(state.error)}</div>`;
+      return;
+    }
+    if (!state.models.length) {
+      el.models.innerHTML = `<div class="loading">No model data yet.</div>`;
+      return;
+    }
+
+    el.models.innerHTML = state.models.map(m => {
+      const meta = modelMeta(m.modelId);
+      const posHtml = m.positions.length ? m.positions.map(p => {
+        const cls = p.direction === "UP" ? "up" : "down";
+        return `<span class="${cls}">${p.direction}</span> ${p.shares.toFixed(3)} sh ($${(p.mark ?? p.avgCost).toFixed(3)})`;
+      }).join(" | ") : "No Position";
+
+      const iconHtml = meta.icon.startsWith("/")
+        ? `<img src="${meta.icon}" alt="${escapeHtml(meta.label)}" />`
+        : `<span class="emoji">${meta.icon}</span>`;
+
+      return `
+        <article class="model-card">
+          <div class="model-header">
+            <div class="model-name">${iconHtml}<span>${escapeHtml(meta.label)}</span></div>
+            <div class="model-time">${escapeHtml(fmtAge(m.lastActivityTs))}</div>
+          </div>
+          <div class="metrics">
+            <div class="metric-line"><span class="k">Eq:</span><span class="v">${fmtMoney(m.totalEquity)}</span></div>
+            <div class="metric-line"><span class="k">P&L:</span><span class="v ${(m.realized + m.unrealized) >= 0 ? "up" : "down"}">${fmtSigned(m.realized + m.unrealized)}</span></div>
+            <div class="metric-line"><span class="k">Trades:</span><span class="v">${m.tradeCount}</span></div>
+          </div>
+          <div class="positions-line"><b>POS:</b> ${posHtml}</div>
+        </article>
+      `;
+    }).join("");
+  }
+
+  function updateFilterOptions() {
+    if (!el.filter) return;
+    const currentVal = el.filter.value;
+    const modelIds = state.models.map(m => m.modelId);
+
+    let html = `<option value="ALL">ALL MODELS</option>`;
+    for (const id of modelIds) {
+      const m = modelMeta(id);
+      html += `<option value="${escapeHtml(id)}">${escapeHtml(m.label)}</option>`;
+    }
+    el.filter.innerHTML = html;
+
+    // restore selection if still valid
+    if (currentVal === "ALL" || modelIds.includes(currentVal)) {
+      el.filter.value = currentVal;
+    } else {
+      el.filter.value = "ALL";
+      state.selectedModelId = "ALL";
+    }
+  }
+
+  function renderChat() {
+    if (!el.chat) return;
+    if (!state.events.length) {
+      el.chat.innerHTML = `<div class="loading">Waiting for cycle data...</div>`;
+      return;
+    }
+
+    const filtered = state.selectedModelId === "ALL"
+      ? state.events
+      : state.events.filter(e => e.modelId === state.selectedModelId);
+
+    if (!filtered.length) {
+      el.chat.innerHTML = `<div class="empty-note" style="padding:10px;">No events matching the filter.</div>`;
+      return;
+    }
+
+    el.chat.innerHTML = filtered.map(ev => {
+      const meta = modelMeta(ev.modelId);
+      const iconHtml = meta.icon.startsWith("/")
+        ? `<img src="${meta.icon}" style="width:16px;" alt="${escapeHtml(meta.label)}" />`
+        : `<span class="emoji">${meta.icon}</span>`;
+
+      let actionHtml = "";
+      if (ev.actions && ev.actions.length > 0) {
+        actionHtml = ev.actions.map(a => {
+          const type = String(a.type || "wait").toLowerCase();
+          const side = String(a.side || "").replace(/_/g, " ");
+          const parts = [type.toUpperCase()];
+          if (side) parts.push(side);
+          if (a.size > 0) parts.push(`${a.size}sh`);
+          return `<span class="action-chip ${actionClass(type)}">${escapeHtml(parts.join(" "))}</span>`;
+        }).join("");
+
+        const firstRationale = ev.actions.find(a => a.rationale)?.rationale;
+        if (firstRationale && !ev.reasoning) ev.reasoning = firstRationale;
+      } else {
+        actionHtml = `<span class="action-chip action-wait">WAIT</span>`;
+      }
+
+      // We extract thinking from reasoning, or attempt to extract from XML tags in rawResp if reasoning is empty
+      let thinking = ev.reasoning || "";
+      if (!thinking && ev.rawResp) {
+        const m = ev.rawResp.match(/<reasoning>([\s\S]*?)<\/reasoning>/i);
+        if (m) thinking = m[1].trim();
+      }
+
+      return `
+        <article class="chat-card">
+          <div class="chat-header">
+            <div style="display:flex;align-items:center;gap:6px;font-weight:700;font-size:13px;">
+              ${iconHtml} ${escapeHtml(meta.label)}
             </div>
+            <div style="font-size:11px;color:var(--muted)">
+              ${escapeHtml(fmtShortTime(ev.ts))}
+            </div>
+          </div>
+          <div class="chat-body">
+            
+            ${ev.prompt ? `
+            <details class="chat-details">
+              <summary>↳ Expand User Prompt Context</summary>
+              <pre class="chat-prompt">${escapeHtml(ev.prompt)}</pre>
+            </details>
+            ` : ""}
 
-            <div class="action-list">${actionHtml}</div>
-            <div class="rationale">${escapeHtml(rationale)}</div>
+            ${thinking ? `
+            <details class="chat-details" open>
+              <summary>↳ Thinking Process (Chain of Thought)</summary>
+              <pre class="chat-reasoning">${escapeHtml(thinking)}</pre>
+            </details>
+            ` : ""}
 
-            ${
-              reasoning
-                ? `<details class="details"><summary>Show full reasoning</summary><pre>${escapeHtml(reasoning)}</pre></details>`
-                : ""
-            }
-          </article>
-        `;
-      })
-      .join("");
+            <div class="chat-block">
+              <div class="chat-label">Executing Action</div>
+              <div class="chat-action-container">${actionHtml}</div>
+            </div>
+            
+          </div>
+        </article>
+      `;
+    }).join("");
   }
 
   function render() {
     renderMarket();
-    renderModels();
-    renderDecisions();
+    renderLeaderboard();
+    updateFilterOptions();
+    renderChat();
 
     if (el.refresh) {
       el.refresh.textContent = state.lastFetchMs
-        ? `Last refresh: ${new Date(state.lastFetchMs).toLocaleTimeString("en-US", { hour12: false })}`
+        ? `Refreshed: ${new Date(state.lastFetchMs).toLocaleTimeString("en-US", { hour12: false })}`
         : "Loading...";
     }
   }
@@ -514,14 +500,12 @@
   function updateCountdown() {
     const node = document.getElementById("countdown");
     if (!node) return;
-
     const endTs = parseTs(state.market?.market_end_time);
     if (!endTs) {
       node.textContent = "--:--";
       node.className = "warn";
       return;
     }
-
     const left = Math.max(0, endTs - Date.now());
     const mins = Math.floor(left / 60000);
     const secs = Math.floor((left % 60000) / 1000);
@@ -538,37 +522,32 @@
         fetchJsonSafe("/runtime_models", { models: [] }),
       ]);
 
-      const runtimeIds = uniqueModels(runtimeResp?.models);
-      const ids = (runtimeIds.length ? runtimeIds : uniqueModels(modelResp?.models)).slice(
-        0,
-        MAX_MODELS
-      );
+      const runtimeIds = [...new Set(runtimeResp?.models || [])].filter(m => m && m !== "default");
+      const ids = (runtimeIds.length ? runtimeIds : [...new Set(modelResp?.models || [])].filter(m => m && m !== "default")).slice(0, MAX_MODELS);
+
       const snapshots = await Promise.all(
         ids.map(async (id) => {
-          try {
-            return await loadModel(id, market);
-          } catch (e) {
-            console.error("failed model load", id, e);
-            return null;
-          }
+          try { return await loadModel(id, market); }
+          catch (e) { console.error("failed", id, e); return null; }
         })
       );
 
-      const rows = snapshots.filter(Boolean);
-      rows.sort((a, b) => {
-        if (b.lastActivityTs !== a.lastActivityTs) return b.lastActivityTs - a.lastActivityTs;
-        return a.modelId.localeCompare(b.modelId);
+      const validModels = snapshots.filter(Boolean);
+
+      // Sort leaderboard initially by Total Equity descending
+      validModels.sort((a, b) => {
+        const valA = a.totalEquity ?? -99999;
+        const valB = b.totalEquity ?? -99999;
+        return valB - valA;
       });
 
-      const selected = rows.slice(0, MAX_MODELS);
-
       state.market = market;
-      state.models = selected;
+      state.models = validModels;
+      state.events = groupEvents(validModels);
       state.lastFetchMs = Date.now();
       state.error = null;
 
-      const source = runtimeIds.length ? "runtime" : "history";
-      setStatus(`Live ${selected.length} model(s) · ${source}`, false);
+      setStatus(`Live ${validModels.length} model(s)`, false);
       render();
     } catch (err) {
       console.error(err);

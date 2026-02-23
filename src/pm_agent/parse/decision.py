@@ -18,6 +18,7 @@ class ParsedDecision:
     reasoning: str
     decision: dict[str, Any]
     raw: str
+    prompt: str = ""
 
 
 class DecisionParseError(RuntimeError):

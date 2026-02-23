@@ -61,6 +61,13 @@ def _as_float(v: str | None, default: float) -> float:
         return default
 
 
+def _as_optional_bool(v: str | None) -> bool | None:
+    """Return True/False if *v* looks like a boolean string, else None."""
+    if v is None or str(v).strip() == "":
+        return None
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class Settings:
     ai_provider: str = "openai"
@@ -84,6 +91,29 @@ class Settings:
     qwen_api_key: str = ""
     qwen_model: str = "qwen-max"
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    grok_api_key: str = ""
+    grok_model: str = "grok-3"
+    grok_base_url: str = "https://api.x.ai/v1"
+
+    glm_api_key: str = ""
+    glm_model: str = "glm-4-flash"
+    glm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+
+    custom_api_key: str = ""
+    custom_model: str = "custom-model"
+    custom_base_url: str = ""
+
+    # Per-provider simulation_mode overrides.
+    # None means "inherit global simulation_mode".
+    openai_simulation_mode: bool | None = None
+    deepseek_simulation_mode: bool | None = None
+    gemini_simulation_mode: bool | None = None
+    claude_simulation_mode: bool | None = None
+    qwen_simulation_mode: bool | None = None
+    grok_simulation_mode: bool | None = None
+    glm_simulation_mode: bool | None = None
+    custom_simulation_mode: bool | None = None
 
     polymarket_host: str = "https://clob.polymarket.com"
     polymarket_chain_id: int = 137
@@ -127,6 +157,16 @@ class Settings:
 
     def get_ai_providers(self) -> list[str]:
         return [p.strip() for p in self.ai_provider.split(",") if p.strip()]
+
+    def get_provider_simulation_mode(self, provider: str) -> bool:
+        """Return effective simulation mode for a given provider.
+
+        Checks ``<PROVIDER>_simulation_mode`` first; falls back to the
+        global ``simulation_mode`` if the per-provider field is None.
+        """
+        field = f"{provider.lower().replace('-', '_')}_simulation_mode"
+        override: bool | None = getattr(self, field, None)
+        return override if override is not None else self.simulation_mode
 
     def __post_init__(self) -> None:
         self.ai_provider = (self.ai_provider or "openai").lower()
@@ -213,6 +253,24 @@ def load_settings() -> Settings:
             env,
         )
         or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        grok_api_key=_getenv("GROK_API_KEY", shared_api_key, env) or "",
+        grok_model=_getenv("GROK_MODEL", "grok-3", env) or "grok-3",
+        grok_base_url=_getenv("GROK_BASE_URL", "https://api.x.ai/v1", env) or "https://api.x.ai/v1",
+        glm_api_key=_getenv("GLM_API_KEY", shared_api_key, env) or "",
+        glm_model=_getenv("GLM_MODEL", "glm-4-flash", env) or "glm-4-flash",
+        glm_base_url=_getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4", env)
+        or "https://open.bigmodel.cn/api/paas/v4",
+        custom_api_key=_getenv("CUSTOM_API_KEY", "", env) or "",
+        custom_model=_getenv("CUSTOM_MODEL", "custom-model", env) or "custom-model",
+        custom_base_url=_getenv("CUSTOM_BASE_URL", "", env) or "",
+        openai_simulation_mode=_as_optional_bool(_getenv("OPENAI_SIMULATION_MODE", "", env)),
+        deepseek_simulation_mode=_as_optional_bool(_getenv("DEEPSEEK_SIMULATION_MODE", "", env)),
+        gemini_simulation_mode=_as_optional_bool(_getenv("GEMINI_SIMULATION_MODE", "", env)),
+        claude_simulation_mode=_as_optional_bool(_getenv("CLAUDE_SIMULATION_MODE", "", env)),
+        qwen_simulation_mode=_as_optional_bool(_getenv("QWEN_SIMULATION_MODE", "", env)),
+        grok_simulation_mode=_as_optional_bool(_getenv("GROK_SIMULATION_MODE", "", env)),
+        glm_simulation_mode=_as_optional_bool(_getenv("GLM_SIMULATION_MODE", "", env)),
+        custom_simulation_mode=_as_optional_bool(_getenv("CUSTOM_SIMULATION_MODE", "", env)),
         polymarket_host=_getenv("POLYMARKET_HOST", "https://clob.polymarket.com", env)
         or "https://clob.polymarket.com",
         polymarket_chain_id=_as_int(_getenv("POLYMARKET_CHAIN_ID", "137", env), 137),

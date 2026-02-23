@@ -45,6 +45,28 @@ class PolymarketClient:
     def _web_client(self) -> httpx.Client:
         return httpx.Client(timeout=self.timeout_s, follow_redirects=True)
 
+    def _make_settings(self, *, with_relayer: bool = False) -> SimpleNamespace:
+        """Build a unified settings namespace for clob helpers."""
+        actual_funder = self._cached_funder or self.funder
+        ns = SimpleNamespace(
+            private_key=self.private_key,
+            wallet_type=self.wallet_type,
+            signature_type=self.signature_type,
+            funder=actual_funder,
+            polymarket_host=self.host,
+            polymarket_chain_id=self.chain_id,
+            polymarket_api_key=self.api_key,
+            polymarket_api_secret=self.api_secret,
+            polymarket_api_passphrase=self.api_passphrase,
+            polymarket_private_key=self.private_key,
+            polymarket_wallet_type=self.wallet_type,
+            polymarket_signature_type=self.signature_type,
+            polymarket_funder=actual_funder,
+        )
+        if with_relayer:
+            ns.polymarket_relayer_url = self.relayer_url
+        return ns
+
     @staticmethod
     def _month_slug(dt_et: dt.datetime) -> str:
         return dt_et.strftime("%b").lower()
@@ -109,8 +131,7 @@ class PolymarketClient:
                 dedup.append(s)
         return dedup
 
-    def _clob_client(self):
-        actual_funder = self.funder
+        # Auto-derive proxy funder for magic_link / proxy wallet types.
         wallet_type = str(self.wallet_type or "auto").strip().lower()
         should_derive_proxy_funder = wallet_type in {
             "auto",
@@ -122,11 +143,10 @@ class PolymarketClient:
             "proxy",
             "polymarket_proxy",
         }
-
         if (
-            not actual_funder
+            not self._cached_funder
+            and not self.funder
             and self.private_key
-            and not self._cached_funder
             and should_derive_proxy_funder
         ):
             try:
@@ -135,30 +155,11 @@ class PolymarketClient:
                 derived_proxy = get_proxy_address(self.private_key, self.chain_id)
                 if derived_proxy:
                     self._cached_funder = derived_proxy
-                    actual_funder = derived_proxy
-                    self._logger.info("✅ 自动查询到代理钱包地址: %s", actual_funder)
+                    self._logger.info("✅ 自动查询到代理钱包地址: %s", derived_proxy)
             except Exception as e:
                 self._logger.warning("⚠️ 无法自动查询代理钱包地址: %s", e)
 
-        if self._cached_funder:
-            actual_funder = self._cached_funder
-
-        settings = SimpleNamespace(
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=actual_funder,
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=actual_funder,
-        )
-        return _get_clob_client(settings)
+        return _get_clob_client(self._make_settings())
 
     def _fetch_market_info_once(self, slug: str) -> dict[str, Any] | None:
         with self._web_client() as c:
@@ -380,23 +381,8 @@ class PolymarketClient:
         amount: float,
         order_type: Optional[Any] = None,
     ) -> dict:
-        settings = SimpleNamespace(
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
         return _submit_market_order(
-            settings,
+            self._make_settings(),
             side=side,
             token_id=token_id,
             amount=amount,
@@ -404,53 +390,13 @@ class PolymarketClient:
         )
 
     def get_account_balance(self) -> float:
-        settings = SimpleNamespace(
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
-        return _get_account_balance(settings)
+        return _get_account_balance(self._make_settings())
 
     def get_token_balances(self, token_ids: list[str]) -> dict[str, float]:
-        settings = SimpleNamespace(
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
-        return _get_token_balances(settings, token_ids)
+        return _get_token_balances(self._make_settings(), token_ids)
 
     def get_user_address(self) -> str:
-        settings = SimpleNamespace(
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
-        return _get_user_address(settings)
+        return _get_user_address(self._make_settings())
 
     def get_positions(
         self,
@@ -459,23 +405,8 @@ class PolymarketClient:
         redeemable_only: bool = False,
         size_threshold: float = 0.0,
     ) -> list[dict[str, Any]]:
-        settings = SimpleNamespace(
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
         return _get_positions(
-            settings,
+            self._make_settings(),
             user_address=user_address,
             redeemable_only=redeemable_only,
             size_threshold=size_threshold,
@@ -512,24 +443,8 @@ class PolymarketClient:
         use_relayer: bool = True,
         metadata: str | None = None,
     ) -> dict[str, Any]:
-        settings = SimpleNamespace(
-            polymarket_host=self.host,
-            polymarket_chain_id=self.chain_id,
-            polymarket_api_key=self.api_key,
-            polymarket_api_secret=self.api_secret,
-            polymarket_api_passphrase=self.api_passphrase,
-            polymarket_private_key=self.private_key,
-            polymarket_wallet_type=self.wallet_type,
-            polymarket_signature_type=self.signature_type,
-            polymarket_funder=self.funder,
-            polymarket_relayer_url=self.relayer_url,
-            private_key=self.private_key,
-            wallet_type=self.wallet_type,
-            signature_type=self.signature_type,
-            funder=self.funder,
-        )
         return _redeem_condition(
-            settings,
+            self._make_settings(with_relayer=True),
             condition_id=condition_id,
             index_sets=index_sets,
             use_relayer=use_relayer,

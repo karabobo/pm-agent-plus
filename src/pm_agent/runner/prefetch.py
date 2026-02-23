@@ -1,0 +1,272 @@
+"""pm_agent.runner.prefetch — Background data prefetch thread.
+
+Extracted from the ``data_prefetch_thread`` module-level function in
+``main.py``.  All shared state is now passed as explicit parameters rather
+than relying on global variables, making the function independently testable.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import threading
+import time
+from typing import Any
+
+from pm_agent.config import Settings
+from pm_agent.data.ohlcv import OHLCVSource
+from pm_agent.db.sqlite import SQLiteDB
+from pm_agent.polymarket.client import PolymarketClient
+from pm_agent.utils.logging import get_logger
+from pm_agent.utils.time import utcnow
+
+from pm_agent.runner.helpers import (
+    best_price,
+    normalize_hourly,
+    parse_utc,
+    query_net_holdings,
+    safe_float,
+    settle_position,
+    settlement_price_from_position_row,
+    all_model_ids,
+    startup_cleanup_stale_positions,
+    settle_market_if_needed,
+)
+
+logger = get_logger("pm_agent.runner.prefetch")
+
+
+def data_prefetch_thread(
+    pm: PolymarketClient,
+    ohlcv: OHLCVSource,
+    symbol: str,
+    s: Settings,
+    db: SQLiteDB,
+    model_pm_clients: dict[str, PolymarketClient] | None = None,
+    *,
+    cache: Any,           # MarketCache instance
+    cache_lock: threading.Lock,
+    stop_event: threading.Event,
+) -> None:
+    """Background thread: keeps the shared ``MarketCache`` up-to-date.
+
+    Runs indefinitely until *stop_event* is set.  Fetches:
+    - BTC spot price via WebSocket / REST every second
+    - Hourly market info (UP/DOWN token IDs, best bid/ask) on first run or
+      when the current market expires
+    - Wallet balances every second in live mode
+    """
+    logger.info("Data prefetch thread started (smart update strategy)")
+    current_token_ids: list[str] = []
+    market_end_time: dt.datetime | None = None
+    first_run = True
+    startup_cleanup_done = False
+    error_count = 0
+
+    while not stop_event.is_set():
+        try:
+            max_retries = 3
+            current_btc_price: float | None = None
+
+            for attempt in range(max_retries):
+                wait_for_ready = first_run and attempt == 0
+                current_btc_price = ohlcv.get_current_price(
+                    symbol,
+                    "1h",
+                    wait_for_ready=wait_for_ready,
+                    wait_timeout=15 if wait_for_ready else 2,
+                    allow_rest_fallback=False,
+                )
+                if current_btc_price is not None and current_btc_price > 0:
+                    if first_run:
+                        logger.info("BTC WebSocket ready, current price: $%.2f", current_btc_price)
+                    break
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+
+            first_run = False
+
+            if current_btc_price is not None and current_btc_price > 0:
+                with cache_lock:
+                    cache["current_btc_price"] = current_btc_price
+            else:
+                logger.warning("Unable to get current BTC price, will retry next cycle")
+
+            now_utc = utcnow()
+            with cache_lock:
+                cached_hourly = cache.get("hourly_market")
+                cached_price_to_beat = cache.get("price_to_beat")
+
+            need_market_update = cached_hourly is None or (
+                market_end_time is not None and now_utc >= market_end_time
+            )
+
+            if need_market_update and cached_hourly is not None:
+                logger.info("Current market ended, fetching next market")
+                try:
+                    final_btc_price = current_btc_price or ohlcv.get_current_price(symbol, "1h")
+                    logger.info(
+                        "Settlement check: final_btc=%s, price_to_beat=%s",
+                        final_btc_price,
+                        cached_price_to_beat,
+                    )
+                    settled_models = settle_market_if_needed(
+                        db=db,
+                        cached_hourly=cached_hourly,
+                        final_btc_price=final_btc_price,
+                        price_to_beat=(
+                            safe_float(cached_price_to_beat, default=0.0)
+                            if cached_price_to_beat is not None
+                            else None
+                        ),
+                        simulation_mode=s.simulation_mode,
+                        model_pm_clients=model_pm_clients,
+                        auto_redeem_use_relayer=s.auto_redeem_use_relayer,
+                    )
+                    settled_token_ids = [
+                        t
+                        for t in [
+                            cached_hourly.get("up_token_id"),
+                            cached_hourly.get("down_token_id"),
+                        ]
+                        if t
+                    ]
+                    if settled_token_ids and settled_models:
+                        for mid in settled_models:
+                            try:
+                                db.clear_session_trades(settled_token_ids, model_id=mid)
+                            except Exception as clear_error:
+                                logger.warning(
+                                    "Failed to clear trades for [%s]: %s", mid, clear_error
+                                )
+                except Exception as settle_error:
+                    logger.error("Failed to settle positions: %s", settle_error)
+
+            if need_market_update:
+                logger.info("🔄 Fetching new market info")
+                hourly_raw = pm.get_hourly_market_prices(prefix=s.polymarket_hourly_prefix)
+                hourly = normalize_hourly(hourly_raw)
+
+                end_time_utc = hourly.get("end_time_utc")
+                end_dt = parse_utc(end_time_utc)
+                market_end_time = end_dt
+                if end_dt is not None:
+                    remain = max(0, int((end_dt - utcnow()).total_seconds()))
+                    logger.info(
+                        "Market ends at %s UTC, %ss remaining",
+                        end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        remain,
+                    )
+                logger.info(
+                    "📅 Market: %s | End time: %s UTC",
+                    hourly.get("slug"),
+                    end_dt.strftime("%Y-%m-%d %H:%M:%S") if end_dt else "N/A",
+                )
+
+                up_id = hourly.get("up_token_id")
+                down_id = hourly.get("down_token_id")
+                current_token_ids = [t for t in [up_id, down_id] if isinstance(t, str) and t]
+
+                if not startup_cleanup_done:
+                    startup_cleanup_done = True
+                    if current_token_ids:
+                        try:
+                            startup_cleanup_stale_positions(db, current_token_ids, s.simulation_mode)
+                        except Exception as cleanup_error:
+                            logger.error("Startup cleanup failed: %s", cleanup_error)
+
+                price_to_beat: float | None = None
+                event_start = (hourly.get("market") or {}).get("event_start_time")
+                if isinstance(event_start, str) and event_start:
+                    start_dt = parse_utc(event_start)
+                    if start_dt is not None:
+                        price_to_beat = ohlcv.fetch_futures_open_at_cached(symbol, start_dt)
+                if price_to_beat is None and end_dt is not None:
+                    start_dt = end_dt - dt.timedelta(hours=1)
+                    price_to_beat = ohlcv.fetch_futures_open_at_cached(symbol, start_dt)
+
+                with cache_lock:
+                    cache["hourly_market"] = hourly
+                    cache["token_ids"] = current_token_ids
+                    cache["price_to_beat"] = price_to_beat
+
+                # Push fresh market data to the dashboard server.
+                _push_market_prices_to_server(cache, cache_lock, hourly, up_id, down_id)
+
+            # Re-read to get current token IDs for orderbook refresh.
+            with cache_lock:
+                hourly = cache.get("hourly_market")
+
+            if hourly and current_token_ids:
+                orderbooks = pm._fetch_orderbooks(current_token_ids)
+                up_token_id = hourly.get("up_token_id")
+                down_token_id = hourly.get("down_token_id")
+
+                if up_token_id and up_token_id in orderbooks:
+                    ob = orderbooks[up_token_id]
+                    (hourly.get("up") or {})["best_bid"] = best_price(ob, "bids")
+                    (hourly.get("up") or {})["best_ask"] = best_price(ob, "asks")
+                if down_token_id and down_token_id in orderbooks:
+                    ob = orderbooks[down_token_id]
+                    (hourly.get("down") or {})["best_bid"] = best_price(ob, "bids")
+                    (hourly.get("down") or {})["best_ask"] = best_price(ob, "asks")
+
+                with cache_lock:
+                    cache["hourly_market"] = hourly
+
+                up_id = hourly.get("up_token_id")
+                down_id = hourly.get("down_token_id")
+                _push_market_prices_to_server(cache, cache_lock, hourly, up_id, down_id)
+
+                balances: dict[str, float] = (
+                    {} if s.simulation_mode else pm.get_token_balances(current_token_ids)
+                )
+                with cache_lock:
+                    cache["balances"] = balances
+                    cache["last_update"] = time.time()
+
+            error_count = 0
+            time.sleep(1)
+
+        except Exception as e:
+            msg = str(e).lower()
+            is_network = any(x in msg for x in ("ssl", "eof", "connection", "timeout"))
+            error_count += 1
+            wait_time = min(10, 5 + error_count)
+            if is_network:
+                logger.warning("Network issue #%d (will retry): %s", error_count, e)
+                if error_count >= 3:
+                    logger.warning("Multiple network failures, waiting %ss...", wait_time)
+            else:
+                logger.error("Data prefetch error: %s", e, exc_info=True)
+            time.sleep(wait_time)
+
+
+def _push_market_prices_to_server(
+    cache: Any,
+    cache_lock: threading.Lock,
+    hourly: dict,
+    up_id: str | None,
+    down_id: str | None,
+) -> None:
+    """Push the latest market prices to the FastAPI dashboard cache."""
+    try:
+        from pm_agent.server import update_market_prices
+
+        with cache_lock:
+            ptb = cache.get("price_to_beat")
+            cbtc = cache.get("current_btc_price")
+
+        update_market_prices(
+            up_bid=(hourly.get("up") or {}).get("best_bid"),
+            up_ask=(hourly.get("up") or {}).get("best_ask"),
+            down_bid=(hourly.get("down") or {}).get("best_bid"),
+            down_ask=(hourly.get("down") or {}).get("best_ask"),
+            slug=hourly.get("slug"),
+            title=(hourly.get("market") or {}).get("question"),
+            end_time=hourly.get("end_time_utc"),
+            price_to_beat=ptb,
+            current_btc_price=cbtc,
+            up_token_id=up_id,
+            down_token_id=down_id,
+        )
+    except Exception as e:
+        logger.warning("Failed to update server price cache: %s", e)

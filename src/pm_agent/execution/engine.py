@@ -29,6 +29,17 @@ class ExecutionEngine:
         actions = self._sort_actions(decision.get("actions", []))
         results: list[dict[str, Any]] = []
 
+        # Check daily trade limit once before processing any actions.
+        todays_buys = self.db.count_todays_trades(self.model_id)
+        daily_limit_reached = todays_buys >= self.limits.max_daily_trades
+        if daily_limit_reached:
+            logger.warning(
+                "[%s] Daily trade limit reached (%d/%d), only SELL/close actions allowed",
+                self.model_id,
+                todays_buys,
+                self.limits.max_daily_trades,
+            )
+
         for a in actions:
             try:
                 a2 = enforce_action(a, self.limits)
@@ -58,6 +69,23 @@ class ExecutionEngine:
             side = str(a2.get("side", "")).lower()
             price = a2.get("price", 0)
             size = a2.get("size", 0)
+            is_buy = side.startswith("buy_")
+
+            # Block new BUY orders if daily limit is reached.
+            if is_buy and daily_limit_reached and a2.get("type") == "open":
+                res = {
+                    "action": a2,
+                    "status": "rejected_risk",
+                    "error": f"daily trade limit reached ({todays_buys}/{self.limits.max_daily_trades})",
+                }
+                results.append(res)
+                self.db.log(
+                    ts=iso(utcnow()),
+                    type_="risk_reject",
+                    payload_json=json.dumps(res, ensure_ascii=False),
+                    model_id=self.model_id,
+                )
+                continue
 
             if not token_id:
                 res = {"action": a2, "status": "rejected", "error": "missing token_id"}
@@ -105,7 +133,10 @@ class ExecutionEngine:
                     current_balance = db_positions.get(str(token_id), {}).get("shares", 0)
                     if size > current_balance:
                         logger.warning(
-                            f"[SIMULATION] Sell size {size} exceeds balance {current_balance}, adjusting to {current_balance}"
+                            "[SIMULATION] Sell size %s exceeds balance %s, adjusting to %s",
+                            size,
+                            current_balance,
+                            current_balance,
                         )
                         size = current_balance
 
@@ -129,7 +160,10 @@ class ExecutionEngine:
                         current_balance = balances.get(str(token_id), 0)
                         if size > current_balance:
                             logger.warning(
-                                f"Sell size {size} exceeds balance {current_balance}, adjusting to {current_balance}"
+                                "Sell size %s exceeds balance %s, adjusting to %s",
+                                size,
+                                current_balance,
+                                current_balance,
                             )
                             size = current_balance
 
@@ -149,17 +183,28 @@ class ExecutionEngine:
                             continue
                     except Exception as e:
                         logger.warning(
-                            f"Failed to get balance for {token_id}: {e}, using original size"
+                            "Failed to get balance for %s: %s, using original size",
+                            token_id,
+                            e,
                         )
 
                 amount = size
 
+
             logger.info(
-                f"{'[SIMULATION] ' if self.simulation_mode else ''}Submitting market order side={'BUY' if is_buy else 'SELL'} token_id={token_id} amount={amount} price={price} size={size}"
+                "%s Submitting market order side=%s token_id=%s amount=%s price=%s size=%s",
+                "[SIMULATION]" if self.simulation_mode else "[LIVE]",
+                "BUY" if is_buy else "SELL",
+                token_id,
+                amount,
+                price,
+                size,
             )
 
             if self.simulation_mode:
-                logger.info("[SIMULATION] Skipping real order submission, recording simulated trade")
+                logger.info(
+                    "[SIMULATION] Skipping real order submission, recording simulated trade"
+                )
                 realized_pnl_change = 0
                 if not is_buy:
                     positions = self.db.get_positions([token_id], model_id=self.model_id)
@@ -257,11 +302,16 @@ class ExecutionEngine:
                             logger.error(f"Failed to query actual balance: {balance_err}")
 
                     if attempt < max_attempts - 1:
-                        logger.warning(
-                            f"SELL order failed (attempt {attempt + 1}/{max_attempts}): {e}, retrying immediately..."
-                        )
+                            logger.warning(
+                                "SELL order failed (attempt %d/%d): %s, retrying immediately...",
+                                attempt + 1,
+                                max_attempts,
+                                e,
+                            )
                     else:
-                        logger.error(f"SELL order failed after {max_attempts} attempts: {e}")
+                        logger.error(
+                            "SELL order failed after %d attempts: %s", max_attempts, e
+                        )
 
             if order is None and last_error is not None:
                 res = {"action": a2, "status": "failed", "error": str(last_error)}

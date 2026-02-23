@@ -39,7 +39,11 @@ class AIClient:
         logger = get_logger("pm_agent.ai")
         provider = (self.provider or "openai").lower()
 
-        if provider in {"openai", "deepseek", "qwen"} and self.base_url:
+        # ----------------------------------------------------------------
+        # OpenAI-compatible Chat Completions (includes grok, glm, custom)
+        # ----------------------------------------------------------------
+        _openai_compat = {"openai", "deepseek", "qwen", "grok", "glm", "custom"}
+        if provider in _openai_compat and self.base_url:
             url = _ensure_chat_url(self.base_url)
             body = {
                 "model": self.model,
@@ -64,7 +68,7 @@ class AIClient:
             try:
                 return str(payload["choices"][0]["message"]["content"])
             except (KeyError, ValueError, TypeError):
-                logger.warning("Unexpected openai/deepseek/qwen payload: %s", payload)
+                logger.warning("Unexpected %s payload: %s", provider, payload)
                 return str(payload)
 
         if provider == "gemini" and self.base_url:

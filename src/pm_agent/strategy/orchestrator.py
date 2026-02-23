@@ -253,4 +253,6 @@ class StrategyOrchestrator:
         indicators_snapshot = self.compute_indicators_snapshot()
         system_prompt, user_prompt = self.build_prompts(cycle_id, context, indicators_snapshot)
         raw = self.ai.call_with_messages(system_prompt, user_prompt)
-        return parse_full_decision_response(raw)
+        parsed = parse_full_decision_response(raw)
+        parsed.prompt = user_prompt
+        return parsed
