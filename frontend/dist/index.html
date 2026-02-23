@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/polylogo.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/icons/polylogo.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/polylogo.png" />
+    <link rel="shortcut icon" href="/favicon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="description" content="Polymarket BTC Hourly Trading Agent - Multi-Model Arena Dashboard" />
+    <meta name="theme-color" content="#292C33" />
+    <title>Polymarket Multi-Model Arena</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div class="title-wrap">
+          <img src="/icons/polylogo.png" alt="Polymarket" class="poly-logo" />
+          <div>
+            <h1>Polymarket Multi-Model Arena</h1>
+            <p id="last-refresh" class="muted">Loading...</p>
+          </div>
+        </div>
+        <div class="status-chip" id="status-chip">Syncing</div>
+      </header>
+
+      <section class="panel">
+        <h2>Market Snapshot</h2>
+        <div id="market-grid" class="market-grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Model Performance (Top 5)</h2>
+        <div id="models-grid" class="models-grid"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Latest Decisions (All Models)</h2>
+        <div id="decisions-grid" class="decisions-grid"></div>
+      </section>
+    </main>
+  </body>
+</html>
