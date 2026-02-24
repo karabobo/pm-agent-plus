@@ -425,7 +425,8 @@ def auto_redeem_model_resolved_positions(
     Called once per ``auto_redeem_interval_sec`` inside the main loop.
     Only runs in live mode when ``s.auto_redeem_enabled`` is True.
     """
-    if s.simulation_mode or not s.auto_redeem_enabled:
+    model_simulation_mode = bool(model_cfg.get("simulation_mode", getattr(s, "simulation_mode", False)))
+    if model_simulation_mode or not s.auto_redeem_enabled:
         return
 
     from pm_agent.polymarket.client import PolymarketClient  # avoid circular import

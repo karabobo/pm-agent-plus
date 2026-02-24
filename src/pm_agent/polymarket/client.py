@@ -30,6 +30,9 @@ class PolymarketClient:
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     api_passphrase: Optional[str] = None
+    builder_api_key: Optional[str] = None
+    builder_api_secret: Optional[str] = None
+    builder_api_passphrase: Optional[str] = None
     chain_id: int = 137
     proxy: Optional[str] = None
     private_key: Optional[str] = None
@@ -58,6 +61,12 @@ class PolymarketClient:
             polymarket_api_key=self.api_key,
             polymarket_api_secret=self.api_secret,
             polymarket_api_passphrase=self.api_passphrase,
+            polymarket_builder_api_key=self.builder_api_key,
+            polymarket_builder_secret=self.builder_api_secret,
+            polymarket_builder_passphrase=self.builder_api_passphrase,
+            poly_builder_api_key=self.builder_api_key,
+            poly_builder_secret=self.builder_api_secret,
+            poly_builder_passphrase=self.builder_api_passphrase,
             polymarket_private_key=self.private_key,
             polymarket_wallet_type=self.wallet_type,
             polymarket_signature_type=self.signature_type,
@@ -131,6 +140,7 @@ class PolymarketClient:
                 dedup.append(s)
         return dedup
 
+    def _clob_client(self):
         # Auto-derive proxy funder for magic_link / proxy wallet types.
         wallet_type = str(self.wallet_type or "auto").strip().lower()
         should_derive_proxy_funder = wallet_type in {

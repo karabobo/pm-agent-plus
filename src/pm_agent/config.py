@@ -75,6 +75,10 @@ class Settings:
     openai_api_key: str = ""
     openai_model: str = ""
     openai_base_url: str = ""
+    # GPT-5 controls (Responses API): reasoning effort can be used to trade latency for quality.
+    # Accepts: none, low, medium, high, xhigh (support varies by model).
+    openai_reasoning_effort: str = "medium"
+    openai_stream: bool = False
 
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-chat"
@@ -120,8 +124,12 @@ class Settings:
     polymarket_api_key: str | None = None
     polymarket_api_secret: str | None = None
     polymarket_api_passphrase: str | None = None
+    polymarket_builder_api_key: str | None = None
+    polymarket_builder_secret: str | None = None
+    polymarket_builder_passphrase: str | None = None
     polymarket_hourly_prefix: str = "bitcoin-up-or-down"
     polymarket_private_keys: str = ""
+    polymarket_funders: str = ""
     polymarket_private_key: str = ""
     polymarket_wallet_type: str = "auto"
     polymarket_signature_type: str = "2"
@@ -132,7 +140,6 @@ class Settings:
     funder: str | None = None
 
     simulation_mode: bool = False
-    mode: str = "conservative"
     model_id: str = "default"
 
     initial_balance_usd: float = 1000.0
@@ -142,6 +149,9 @@ class Settings:
     slippage_bps: int = 30
     min_position_shares: float = 0.01
     run_interval_sec: int = 60
+    model_parallel: bool = True
+    model_max_workers: int = 0
+    reconciliation_sync_interval_sec: int = 5
     auto_redeem_enabled: bool = True
     auto_redeem_interval_sec: int = 60
     auto_redeem_min_value_usd: float = 0.01
@@ -173,10 +183,13 @@ class Settings:
         self.private_key = self.polymarket_private_key
         self.signature_type = self.polymarket_signature_type
         self.funder = self.polymarket_funder
-        self.mode = (self.mode or "conservative").lower()
         self.polymarket_wallet_type = (self.polymarket_wallet_type or "auto").strip().lower()
         if self.auto_redeem_interval_sec < 5:
             self.auto_redeem_interval_sec = 5
+        if self.reconciliation_sync_interval_sec < 2:
+            self.reconciliation_sync_interval_sec = 2
+        if self.model_max_workers < 0:
+            self.model_max_workers = 0
         if self.auto_redeem_min_value_usd < 0:
             self.auto_redeem_min_value_usd = 0.0
         if not self.polymarket_relayer_url:
@@ -206,6 +219,13 @@ class Settings:
             return [self.polymarket_private_key.strip()]
         return []
 
+    def get_funders(self) -> list[str]:
+        if self.polymarket_funders:
+            return [f.strip() for f in self.polymarket_funders.split(",") if f.strip()]
+        if self.polymarket_funder:
+            return [self.polymarket_funder.strip()]
+        return []
+
     def get_db_path(self) -> str:
         if self.simulation_mode:
             if self.sim_db_path:
@@ -220,32 +240,31 @@ class Settings:
 
 def load_settings() -> Settings:
     env = _load_dotenv_map()
-    # Backward-compatible shared key: prefer provider-specific keys first.
-    shared_api_key = _getenv("FASTAPI_KEY", "", env) or ""
-
     gemini_model = _getenv("GEMINI_MODEL", "gemini-3-flash-preview", env) or "gemini-3-flash-preview"
 
     return Settings(
         ai_provider=_getenv("AI_PROVIDER", "openai", env) or "openai",
-        openai_api_key=_getenv("OPENAI_API_KEY", shared_api_key, env) or "",
+        openai_api_key=_getenv("OPENAI_API_KEY", "", env) or "",
         openai_model=_getenv("OPENAI_MODEL", "", env) or "",
         openai_base_url=_getenv("OPENAI_BASE_URL", "", env) or "",
-        deepseek_api_key=_getenv("DEEPSEEK_API_KEY", shared_api_key, env) or "",
+        openai_reasoning_effort=_getenv("OPENAI_REASONING_EFFORT", "medium", env) or "medium",
+        openai_stream=_as_bool(_getenv("OPENAI_STREAM", "false", env), False),
+        deepseek_api_key=_getenv("DEEPSEEK_API_KEY", "", env) or "",
         deepseek_model=_getenv("DEEPSEEK_MODEL", "deepseek-chat", env) or "deepseek-chat",
         deepseek_base_url=_getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1", env)
         or "https://api.deepseek.com/v1",
-        gemini_api_key=_getenv("GEMINI_API_KEY", shared_api_key, env) or "",
+        gemini_api_key=_getenv("GEMINI_API_KEY", "", env) or "",
         gemini_model=gemini_model,
         gemini_base_url=(
             _getenv("GEMINI_BASE_URL", "", env)
             or f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent"
         ),
-        claude_api_key=_getenv("CLAUDE_API_KEY", shared_api_key, env) or "",
+        claude_api_key=_getenv("CLAUDE_API_KEY", "", env) or "",
         claude_model=_getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514", env)
         or "claude-sonnet-4-20250514",
         claude_base_url=_getenv("CLAUDE_BASE_URL", "https://api.anthropic.com/v1/messages", env)
         or "https://api.anthropic.com/v1/messages",
-        qwen_api_key=_getenv("QWEN_API_KEY", shared_api_key, env) or "",
+        qwen_api_key=_getenv("QWEN_API_KEY", "", env) or "",
         qwen_model=_getenv("QWEN_MODEL", "qwen-max", env) or "qwen-max",
         qwen_base_url=_getenv(
             "QWEN_BASE_URL",
@@ -253,10 +272,10 @@ def load_settings() -> Settings:
             env,
         )
         or "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        grok_api_key=_getenv("GROK_API_KEY", shared_api_key, env) or "",
+        grok_api_key=_getenv("GROK_API_KEY", "", env) or "",
         grok_model=_getenv("GROK_MODEL", "grok-3", env) or "grok-3",
         grok_base_url=_getenv("GROK_BASE_URL", "https://api.x.ai/v1", env) or "https://api.x.ai/v1",
-        glm_api_key=_getenv("GLM_API_KEY", shared_api_key, env) or "",
+        glm_api_key=_getenv("GLM_API_KEY", "", env) or "",
         glm_model=_getenv("GLM_MODEL", "glm-4-flash", env) or "glm-4-flash",
         glm_base_url=_getenv("GLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4", env)
         or "https://open.bigmodel.cn/api/paas/v4",
@@ -277,15 +296,30 @@ def load_settings() -> Settings:
         polymarket_api_key=_getenv("POLYMARKET_API_KEY", None, env),
         polymarket_api_secret=_getenv("POLYMARKET_API_SECRET", None, env),
         polymarket_api_passphrase=_getenv("POLYMARKET_API_PASSPHRASE", None, env),
+        polymarket_builder_api_key=_getenv(
+            "POLYMARKET_BUILDER_API_KEY",
+            _getenv("POLY_BUILDER_API_KEY", None, env),
+            env,
+        ),
+        polymarket_builder_secret=_getenv(
+            "POLYMARKET_BUILDER_SECRET",
+            _getenv("POLY_BUILDER_SECRET", None, env),
+            env,
+        ),
+        polymarket_builder_passphrase=_getenv(
+            "POLYMARKET_BUILDER_PASSPHRASE",
+            _getenv("POLY_BUILDER_PASSPHRASE", None, env),
+            env,
+        ),
         polymarket_hourly_prefix=_getenv("POLYMARKET_HOURLY_PREFIX", "bitcoin-up-or-down", env)
         or "bitcoin-up-or-down",
         polymarket_private_keys=_getenv("POLYMARKET_PRIVATE_KEYS", "", env) or "",
+        polymarket_funders=_getenv("POLYMARKET_FUNDERS", "", env) or "",
         polymarket_private_key=_getenv("POLYMARKET_PRIVATE_KEY", "", env) or "",
         polymarket_wallet_type=_getenv("POLYMARKET_WALLET_TYPE", "auto", env) or "auto",
         polymarket_signature_type=_getenv("POLYMARKET_SIGNATURE_TYPE", "2", env) or "2",
         polymarket_funder=_getenv("POLYMARKET_FUNDER", None, env),
         simulation_mode=_as_bool(_getenv("SIMULATION_MODE", "false", env), False),
-        mode=_getenv("MODE", "conservative", env) or "conservative",
         model_id=_getenv("MODEL_ID", "default", env) or "default",
         initial_balance_usd=_as_float(_getenv("INITIAL_BALANCE_USD", "1000", env), 1000.0),
         max_notional_usd=_as_float(_getenv("MAX_NOTIONAL_USD", "200", env), 200.0),
@@ -294,6 +328,11 @@ def load_settings() -> Settings:
         slippage_bps=_as_int(_getenv("SLIPPAGE_BPS", "30", env), 30),
         min_position_shares=_as_float(_getenv("MIN_POSITION_SHARES", "0.01", env), 0.01),
         run_interval_sec=_as_int(_getenv("RUN_INTERVAL_SEC", "60", env), 60),
+        model_parallel=_as_bool(_getenv("MODEL_PARALLEL", "true", env), True),
+        model_max_workers=_as_int(_getenv("MODEL_MAX_WORKERS", "0", env), 0),
+        reconciliation_sync_interval_sec=_as_int(
+            _getenv("RECONCILIATION_SYNC_INTERVAL_SEC", "5", env), 5
+        ),
         auto_redeem_enabled=_as_bool(_getenv("AUTO_REDEEM_ENABLED", "true", env), True),
         auto_redeem_interval_sec=_as_int(_getenv("AUTO_REDEEM_INTERVAL_SEC", "60", env), 60),
         auto_redeem_min_value_usd=_as_float(

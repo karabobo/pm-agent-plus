@@ -28,4 +28,5 @@ def build_user_prompt(inp: UserPromptInputs) -> str:
         payload["session_trading_history"] = inp.session_history
     if inp.decision_history:
         payload["decision_memory"] = inp.decision_history
-    return "Context JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    # Compact JSON keeps token cost lower while preserving identical content.
+    return "Context JSON:" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

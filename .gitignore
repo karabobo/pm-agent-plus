@@ -19,12 +19,16 @@ venv/
 *.pid
 *.out
 *.err
+*.swp
 
 # Local databases
 *.db
 *.db-*
 *.sqlite
 *.sqlite3
+
+# Local ops / gateway helpers (may contain credentials)
+logs.sh
 
 # OS/editor
 .DS_Store

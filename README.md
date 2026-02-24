@@ -5,7 +5,6 @@
 ## Structure
 
 - `src/`: Python source code and runtime entrypoint (`main.py`)
-- `frontend/`: Dashboard frontend assets
 - `.env`: Runtime configuration
 - `.env.example`: Configuration template
 
@@ -13,7 +12,7 @@
 
 ```bash
 cd /root/pm-agent-plus/src
-PYTHONPATH=. python3.11 main.py
+PYTHONPATH=. ../.venv/bin/python main.py
 ```
 
 ## Background Run
@@ -23,6 +22,15 @@ cd /root/pm-agent-plus
 ./start.sh
 ./status.sh
 ./stop.sh
+```
+
+## Real-Time Logs
+
+```bash
+cd /root/pm-agent-plus
+./start.sh --foreground      # 前台运行，实时打印日志
+./status.sh --verbose        # 查看进程详情 + 最近日志
+tail -f pm-agent-plus.log
 ```
 
 - process name: `pm-agent-plus`

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
+import inspect
+import math
 import os
 
 import httpx
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 
 logger = get_logger("pm_agent.clob")
 _client_cache: dict[str, Any] = {}
+_warned_relayer_fallback = False
 
 _PROXY_WALLET_TYPES = {
     "magic",
@@ -67,6 +70,34 @@ def _get_setting(settings: Any, name: str, alt: str | None = None):
     if alt and hasattr(settings, alt):
         return getattr(settings, alt)
     return None
+
+
+def _non_empty_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def _get_builder_creds_from_settings_or_env(settings: Any) -> tuple[str | None, str | None, str | None]:
+    key = (
+        _non_empty_str(_get_setting(settings, "polymarket_builder_api_key", "poly_builder_api_key"))
+        or _non_empty_str(os.getenv("POLYMARKET_BUILDER_API_KEY"))
+        or _non_empty_str(os.getenv("POLY_BUILDER_API_KEY"))
+    )
+    secret = (
+        _non_empty_str(_get_setting(settings, "polymarket_builder_secret", "poly_builder_secret"))
+        or _non_empty_str(os.getenv("POLYMARKET_BUILDER_SECRET"))
+        or _non_empty_str(os.getenv("POLY_BUILDER_SECRET"))
+    )
+    passphrase = (
+        _non_empty_str(
+            _get_setting(settings, "polymarket_builder_passphrase", "poly_builder_passphrase")
+        )
+        or _non_empty_str(os.getenv("POLYMARKET_BUILDER_PASSPHRASE"))
+        or _non_empty_str(os.getenv("POLY_BUILDER_PASSPHRASE"))
+    )
+    return key, secret, passphrase
 
 
 def _resolve_signature_type(settings: Any) -> int | None:
@@ -483,6 +514,7 @@ def _redeem_via_relayer(
     from py_builder_signing_sdk.config import BuilderConfig
     from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
     from py_builder_relayer_client.client import RelayClient
+    from py_builder_relayer_client.exceptions import RelayerApiException
     from py_builder_relayer_client.models import OperationType, SafeTransaction
     from py_clob_client.config import get_contract_config
 
@@ -495,15 +527,44 @@ def _redeem_via_relayer(
     )
 
     client = get_clob_client(settings)
-    creds = getattr(client, "creds", None)
-    if not creds:
-        raise RuntimeError("CLOB API creds missing, cannot authenticate relayer")
+    key, secret, passphrase = _get_builder_creds_from_settings_or_env(settings)
+    using_fallback_clob_creds = False
+    if not (key and secret and passphrase):
+        any_builder_cred = bool(key or secret or passphrase)
+        if any_builder_cred:
+            raise RuntimeError(
+                "Incomplete relayer builder credentials. Set all three: "
+                "POLYMARKET_BUILDER_API_KEY, POLYMARKET_BUILDER_SECRET, "
+                "POLYMARKET_BUILDER_PASSPHRASE."
+            )
+
+        creds = getattr(client, "creds", None)
+        if not creds:
+            raise RuntimeError("CLOB API creds missing, cannot authenticate relayer")
+        key = _non_empty_str(getattr(creds, "api_key", None))
+        secret = _non_empty_str(getattr(creds, "api_secret", None))
+        passphrase = _non_empty_str(getattr(creds, "api_passphrase", None))
+        using_fallback_clob_creds = bool(key and secret and passphrase)
+        if not using_fallback_clob_creds:
+            raise RuntimeError(
+                "Builder credentials missing. Configure POLYMARKET_BUILDER_API_KEY / "
+                "POLYMARKET_BUILDER_SECRET / POLYMARKET_BUILDER_PASSPHRASE."
+            )
+
+    global _warned_relayer_fallback
+    if using_fallback_clob_creds and not _warned_relayer_fallback:
+        logger.warning(
+            "Relayer redeem is using CLOB API creds as fallback. "
+            "If redeem returns 401, configure dedicated builder creds "
+            "(POLYMARKET_BUILDER_API_KEY / SECRET / PASSPHRASE)."
+        )
+        _warned_relayer_fallback = True
 
     builder_cfg = BuilderConfig(
         local_builder_creds=BuilderApiKeyCreds(
-            key=creds.api_key,
-            secret=creds.api_secret,
-            passphrase=creds.api_passphrase,
+            key=str(key),
+            secret=str(secret),
+            passphrase=str(passphrase),
         )
     )
     relay = RelayClient(
@@ -537,7 +598,17 @@ def _redeem_via_relayer(
         data="0x" + calldata.hex(),
         value="0",
     )
-    response = relay.execute([tx], metadata=metadata or f"Auto redeem {condition_id[:10]}")
+    try:
+        response = relay.execute([tx], metadata=metadata or f"Auto redeem {condition_id[:10]}")
+    except RelayerApiException as e:
+        is_auth_error = int(getattr(e, "status_code", 0) or 0) == 401
+        if is_auth_error:
+            raise RuntimeError(
+                "Relayer authorization failed (401). Configure builder credentials: "
+                "POLYMARKET_BUILDER_API_KEY / POLYMARKET_BUILDER_SECRET / "
+                "POLYMARKET_BUILDER_PASSPHRASE."
+            ) from e
+        raise
     mined = response.wait()
     if mined is None:
         raise RuntimeError(f"Relayer redeem failed or timed out for {condition_id}")
@@ -615,16 +686,139 @@ def submit_market_order(
 
     client = get_clob_client(settings)
 
-    if side_upper == BUY:
-        order_args = MarketOrderArgs(token_id=token_id, amount=float(amount))
-    else:
-        order_args = MarketOrderArgs(token_id=token_id, size=float(amount))
+    def _is_buy_precision_error(error: Exception) -> bool:
+        msg = str(error).lower()
+        taker_two_decimals = (
+            "taker amount a max of 2 decimals" in msg
+            or "taker amount a max accuracy of 2" in msg
+            or ("taker amount" in msg and "2 decimals" in msg)
+        )
+        return (
+            side_upper == BUY
+            and "invalid amounts" in msg
+            and "buy orders maker amount" in msg
+            and taker_two_decimals
+        )
 
-    ot = order_type or OrderType.GTC
+    def _submit_buy_via_limit_fallback(ot: Any):
+        # Some venues reject market BUY orders with 3-decimal tick due maker/taker
+        # precision constraints. Retry with an equivalent limit order at the
+        # computed market price to satisfy amount precision requirements.
+        from py_clob_client.clob_types import OrderArgs
+
+        calc_ot = ot or OrderType.GTC
+        px = float(client.calculate_market_price(token_id, side_upper, float(amount), calc_ot))
+        if px <= 0:
+            raise RuntimeError(f"invalid fallback price: {px}")
+
+        # BUY amount is USDC notional; convert to shares and floor to 2 decimals.
+        shares = math.floor((float(amount) / px) * 100.0) / 100.0
+        if shares <= 0:
+            raise RuntimeError(f"fallback shares rounded to zero (amount={amount}, price={px})")
+
+        logger.warning(
+            "Retrying BUY with precision-safe limit order fallback: token=%s price=%.6f "
+            "notional=%.6f shares=%.2f",
+            token_id,
+            px,
+            float(amount),
+            shares,
+        )
+
+        limit_args = OrderArgs(
+            token_id=token_id,
+            price=px,
+            size=shares,
+            side=side_upper,
+        )
+        signed_limit = client.create_order(limit_args)
+        return client.post_order(signed_limit, calc_ot)
+
+    def _safe_sig(obj: Any) -> str:
+        try:
+            return str(inspect.signature(obj))
+        except Exception:
+            return "<unavailable>"
+
+    def _log_order_api_debug(error: Exception) -> None:
+        logger.error(
+            "Order API compatibility debug | error=%s | "
+            "MarketOrderArgs=%s | create_market_order=%s | post_order=%s",
+            error,
+            _safe_sig(MarketOrderArgs),
+            _safe_sig(getattr(client, "create_market_order", None)),
+            _safe_sig(getattr(client, "post_order", None)),
+        )
+
+    # py-clob-client versions differ:
+    # - newer: MarketOrderArgs(token_id, amount, side, ...)
+    # - older: MarketOrderArgs(token_id, amount/size, ...)
+    mo_params = {}
     try:
-        signed = client.create_market_order(order_args, side=side_upper)
-        return client.post_order(signed, ot)
+        mo_params = inspect.signature(MarketOrderArgs).parameters
     except Exception:
-        # Compatibility fallback for older py-clob-client variants.
+        mo_params = {}
+
+    order_kwargs: dict[str, Any] = {"token_id": token_id}
+    if "amount" in mo_params:
+        order_kwargs["amount"] = float(amount)
+    elif "size" in mo_params:
+        order_kwargs["size"] = float(amount)
+    else:
+        order_kwargs["amount"] = float(amount)
+    if "side" in mo_params:
+        order_kwargs["side"] = side_upper
+
+    try:
+        order_args = MarketOrderArgs(**order_kwargs)
+    except TypeError as e:
+        msg = str(e).lower()
+        side_kw_unsupported = (
+            "unexpected keyword argument" in msg and "side" in msg
+        )
+        if not side_kw_unsupported:
+            _log_order_api_debug(e)
+            raise
+        # Compatibility fallback: legacy constructors may not accept `side` kwarg.
+        order_kwargs.pop("side", None)
+        try:
+            order_args = MarketOrderArgs(**order_kwargs)
+        except Exception as inner_e:
+            _log_order_api_debug(inner_e)
+            raise
+
+    ot = order_type
+    if isinstance(ot, str):
+        ot_name = ot.strip().upper()
+        ot = getattr(OrderType, ot_name, None)
+        if ot is None:
+            logger.warning("Unknown order_type=%s, fallback to GTC", order_type)
+            ot = OrderType.GTC
+    if ot is None:
+        ot = OrderType.GTC
+    try:
         signed = client.create_market_order(order_args)
         return client.post_order(signed, ot)
+    except TypeError as e:
+        # Compatibility fallback for older py-clob-client variants that still
+        # expect side to be passed separately.
+        msg = str(e).lower()
+        side_required = ("missing" in msg and "side" in msg)
+        if not side_required:
+            _log_order_api_debug(e)
+            raise
+        try:
+            signed = client.create_market_order(order_args, side=side_upper)
+            return client.post_order(signed, ot)
+        except Exception as inner_e:
+            _log_order_api_debug(inner_e)
+            raise
+    except Exception as e:
+        if _is_buy_precision_error(e):
+            try:
+                return _submit_buy_via_limit_fallback(ot)
+            except Exception as fallback_error:
+                _log_order_api_debug(fallback_error)
+                raise
+        _log_order_api_debug(e)
+        raise

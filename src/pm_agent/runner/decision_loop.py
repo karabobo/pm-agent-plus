@@ -1,9 +1,4 @@
-"""pm_agent.runner.decision_loop — Per-model AI decision processing.
-
-Extracted from the ``process_model_decision`` nested function that lived
-inside ``main.main()``.  Now a standalone function with explicit parameters
-so that it can be tested and imported independently.
-"""
+"""pm_agent.runner.decision_loop — Per-model AI decision processing."""
 from __future__ import annotations
 
 import json
@@ -15,15 +10,10 @@ from typing import Any
 
 from pm_agent.config import Settings
 from pm_agent.db.sqlite import SQLiteDB
+from pm_agent.runner.helpers import compute_phase, parse_utc, safe_float
 from pm_agent.utils import chalk
 from pm_agent.utils.logging import get_logger
 from pm_agent.utils.time import iso, utcnow
-
-from pm_agent.runner.helpers import (
-    compute_phase,
-    parse_utc,
-    safe_float,
-)
 
 logger = get_logger("pm_agent.runner.decision_loop")
 
@@ -31,52 +21,52 @@ logger = get_logger("pm_agent.runner.decision_loop")
 def process_model_decision(
     *,
     model_cfg: dict[str, Any],
-    cache: Any,          # MarketCache (or any object with dict-style .get())
+    cache: Any,
     cache_lock: threading.Lock,
     db: SQLiteDB,
     s: Settings,
     stop_event: threading.Event,
     last_ai_end_time: float,
 ) -> dict[str, Any]:
-    """Run one decision cycle for a single AI model.
-
-    Parameters
-    ----------
-    model_cfg:
-        Dict produced during initialisation; contains keys
-        ``model_id``, ``display_name``, ``orchestrator``, ``engine``.
-    cache:
-        The shared ``MarketCache`` (or any mapping-like object).
-    cache_lock:
-        Lock protecting *cache* reads (kept for backward compatibility;
-        ``MarketCache.__getitem__`` already acquires internally).
-    db:
-        Shared ``SQLiteDB`` instance.
-    s:
-        Application ``Settings``.
-    stop_event:
-        Global shutdown flag.
-    last_ai_end_time:
-        Timestamp of when the previous AI call finished (used for
-        ``time_since_last_ai`` context).
-
-    Returns
-    -------
-    dict with keys ``model_id``, ``display_name``, ``status``, and optionally
-    ``results`` or ``error``.
-    """
+    """Run one decision cycle for a single AI model."""
     model_id: str = model_cfg["model_id"]
     display_name: str = model_cfg["display_name"]
     orchestrator_instance = model_cfg["orchestrator"]
     engine_instance = model_cfg["engine"]
-    # Per-provider simulation flag (may differ from global Settings.simulation_mode)
     model_sim_mode: bool = model_cfg.get("simulation_mode", s.simulation_mode)
+    use_actual_balances: bool = bool(
+        model_cfg.get("use_actual_balances", (not model_sim_mode))
+    )
 
     logger.info(chalk.bold(chalk.magenta(f"\n🤖 [{display_name}] Making decision...")))
     try:
         with cache_lock:
             hourly = dict(cache.get("hourly_market") or {})
             balances = dict(cache.get("balances") or {})
+            raw_balances_by_model = cache.get("balances_by_model") or {}
+            balances_by_model = (
+                {str(mid): dict(vals or {}) for mid, vals in raw_balances_by_model.items()}
+                if isinstance(raw_balances_by_model, dict)
+                else {}
+            )
+            raw_position_details_by_model = cache.get("position_details_by_model") or {}
+            position_details_by_model = (
+                {
+                    str(mid): {
+                        str(tid): dict(detail or {})
+                        for tid, detail in (details or {}).items()
+                    }
+                    for mid, details in raw_position_details_by_model.items()
+                }
+                if isinstance(raw_position_details_by_model, dict)
+                else {}
+            )
+            model_actual_balances = balances_by_model.get(model_id) or balances
+            model_position_details = position_details_by_model.get(model_id) or {}
+            model_actual_avg_prices = {
+                str(tid): safe_float((detail or {}).get("avg_price"), default=0.0)
+                for tid, detail in model_position_details.items()
+            }
             price_to_beat = cache.get("price_to_beat")
             current_btc = cache.get("current_btc_price")
 
@@ -93,7 +83,8 @@ def process_model_decision(
 
         model_db_positions = db.get_positions(
             token_ids,
-            actual_balances=(balances if (token_ids and not model_sim_mode) else None),
+            actual_balances=(model_actual_balances if (token_ids and use_actual_balances) else None),
+            actual_avg_prices=(model_actual_avg_prices if (token_ids and use_actual_balances) else None),
             model_id=model_id,
         )
         model_session_stats = (
@@ -110,7 +101,7 @@ def process_model_decision(
             token_ids=token_ids,
             up_token_id=up_id or "",
             down_token_id=down_id or "",
-            actual_balances=balances,
+            actual_balances=(model_actual_balances if use_actual_balances else {}),
             model_id=model_id,
         )
 
@@ -140,11 +131,20 @@ def process_model_decision(
             )
 
         model_cash = db.get_account_balance(model_id).get("cash_balance", 0.0)
-        account_info: dict[str, Any] = {
+        raw_trade_history = (
+            db.get_trade_history(
+                token_ids,
+                limit=50,
+                model_id=model_id,
+            )
+            if token_ids
+            else []
+        )
+        account_info = {
             "cash_usdc": model_cash,
             "cash_balance": model_cash,
             "position_intelligence": {
-                "trade_history": db.get_trade_history(token_ids, limit=50) if token_ids else [],
+                "trade_history": raw_trade_history,
                 "pattern_analysis": {},
                 "warnings": warning,
                 "ai_notes": "",
@@ -202,10 +202,6 @@ def process_model_decision(
             "down": hourly.get("down"),
             "btc_analysis": btc_analysis,
             "session_phase": session_phase,
-            "_market_price_warning": (
-                "重要：UP/DOWN价格是结果不是原因。价格=f(price_diff, time_remaining)，"
-                "决策应以技术指标为依据。"
-            ),
         }
 
         candidate_markets: list[dict[str, Any]] = []
@@ -232,8 +228,7 @@ def process_model_decision(
             realized_pnl = safe_float(model_session_stats.get("realized_pnl"), default=0.0)
             unrealized_pnl = safe_float(model_session_stats.get("unrealized_pnl"), default=0.0)
             total_pnl = realized_pnl + unrealized_pnl
-            pnl_color = chalk.green if total_pnl >= 0 else chalk.red
-            pnl_text = pnl_color(f"${total_pnl:+.2f}")
+            pnl_text = f"${total_pnl:+.2f}"
             upnl_text = (
                 f" (Unrealized: ${unrealized_pnl:+.2f})" if abs(unrealized_pnl) >= 1e-9 else ""
             )
@@ -292,8 +287,8 @@ def process_model_decision(
             ts=iso(utcnow()),
             type_="ai_raw",
             payload_json=json.dumps(
-                {"cycle_id": cycle_id, "prompt": getattr(parsed, "prompt", ""), "raw": parsed.raw},
-                ensure_ascii=False
+                {"cycle_id": cycle_id, "raw": parsed.raw},
+                ensure_ascii=False,
             ),
             model_id=model_id,
         )
@@ -311,17 +306,18 @@ def process_model_decision(
             model_id=model_id,
         )
 
-        # Print action summary to console.
         actions = parsed.decision.get("actions", [])
         if actions:
             action_summaries = []
-            for a in actions:
-                act_type = a.get("type", "unknown")
-                side = a.get("side", "")
-                size = a.get("size", 0)
-                price = a.get("price", 0)
+            for action in actions:
+                act_type = action.get("type", "unknown")
+                side = action.get("side", "")
+                size = action.get("size", 0)
+                price = action.get("price", 0)
                 if act_type in ("open", "close"):
-                    action_summaries.append(f"{str(act_type).upper()} {side} {size} shares@{price:.2f}")
+                    action_summaries.append(
+                        f"{str(act_type).upper()} {side} {size} shares@{price:.2f}"
+                    )
                 else:
                     action_summaries.append(str(act_type).upper())
             ai_action_text = " | ".join(action_summaries)
@@ -345,43 +341,17 @@ def process_model_decision(
             model_id=model_id,
         )
 
-        for r in results:
-            status = str(r.get("status", "unknown"))
+        for result in results:
+            status = str(result.get("status", "unknown"))
             if status in {"filled", "success", "submitted", "simulated"}:
                 status_emoji, status_color = "✓", chalk.green
             elif status in {"skipped"}:
                 status_emoji, status_color = "→", chalk.dim
             else:
                 status_emoji, status_color = "✗", chalk.red
-            print(f"  {status_color(f'[{status_emoji}] {json.dumps(r, ensure_ascii=False)}')}")
-
-        # Update per-model account snapshot after execution.
-        all_token_ids = [t for t in [up_id, down_id] if t]
-        model_positions = db.get_positions(
-            all_token_ids,
-            actual_balances=(balances if (all_token_ids and not model_sim_mode) else None),
-            model_id=model_id,
-        )
-        total_position_value = 0.0
-        total_unrealized_pnl = 0.0
-        for token_id in all_token_ids:
-            pos = model_positions.get(token_id, {})
-            shares = safe_float(pos.get("shares"), default=0.0)
-            avg_cost = safe_float(pos.get("avg_price"), default=0.0)
-            if token_id == up_id:
-                current_price = safe_float((hourly.get("up") or {}).get("best_bid"), default=avg_cost)
-            else:
-                current_price = safe_float((hourly.get("down") or {}).get("best_bid"), default=avg_cost)
-            total_position_value += shares * current_price
-            total_unrealized_pnl += shares * (current_price - avg_cost)
-
-        db.update_account_balance(
-            model_id=model_id,
-            cash_change=0.0,
-            position_value=total_position_value,
-            unrealized_pnl=total_unrealized_pnl,
-            realized_pnl_change=0.0,
-        )
+            print(
+                f"  {status_color(f'[{status_emoji}] {json.dumps(result, ensure_ascii=False)}')}"
+            )
 
         return {
             "model_id": model_id,

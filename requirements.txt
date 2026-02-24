@@ -24,3 +24,4 @@ websocket-client>=1.5.0
 # Blockchain / Polymarket wallet
 web3>=6.0.0
 py_clob_client>=0.1.0
+py_builder_relayer_client>=0.0.1

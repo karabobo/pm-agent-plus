@@ -3,13 +3,13 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import signal
 import sys
 import threading
 import time
 import traceback
 import uuid
-import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,6 @@ from pm_agent.db.sqlite import SQLiteDB
 from pm_agent.execution.engine import ExecutionEngine
 from pm_agent.execution.risk import RiskLimits
 from pm_agent.polymarket.client import PolymarketClient
-from pm_agent.server import set_runtime_models, start_background_server
 from pm_agent.strategy.orchestrator import StrategyOrchestrator
 from pm_agent.utils import chalk
 from pm_agent.utils.logging import (
@@ -66,9 +65,14 @@ class MarketCache:
     the internal lock, eliminating the risk of forgetting to hold the lock.
     """
 
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # RLock avoids self-deadlock when legacy code acquires cache_lock and then
+    # accesses cache.get()/__getitem__ which also acquires the same lock.
+    _lock: threading.Lock = field(default_factory=threading.RLock, repr=False)
     hourly_market: dict[str, Any] | None = None
     balances: dict[str, float] = field(default_factory=dict)
+    balances_by_model: dict[str, dict[str, float]] = field(default_factory=dict)
+    onchain_cash_by_model: dict[str, float] = field(default_factory=dict)
+    position_details_by_model: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     token_ids: list[str] = field(default_factory=list)
     price_to_beat: float | None = None
     current_btc_price: float | None = None
@@ -87,6 +91,23 @@ class MarketCache:
             return {
                 "hourly_market": self.hourly_market,
                 "balances": dict(self.balances),
+                "balances_by_model": {
+                    str(mid): dict(bal or {}) for mid, bal in self.balances_by_model.items()
+                },
+                "onchain_cash_by_model": {
+                    str(mid): float(cash or 0.0)
+                    for mid, cash in self.onchain_cash_by_model.items()
+                },
+                "position_details_by_model": {
+                    str(mid): {
+                        str(token_id): {
+                            "shares": float((vals or {}).get("shares", 0.0) or 0.0),
+                            "avg_price": float((vals or {}).get("avg_price", 0.0) or 0.0),
+                        }
+                        for token_id, vals in (details or {}).items()
+                    }
+                    for mid, details in self.position_details_by_model.items()
+                },
                 "token_ids": list(self.token_ids),
                 "price_to_beat": self.price_to_beat,
                 "current_btc_price": self.current_btc_price,
@@ -98,8 +119,18 @@ class MarketCache:
     # and ``cached_data.get(k)`` call-sites require zero changes.
     # ------------------------------------------------------------------
     _FIELDS = frozenset(
-        {"hourly_market", "balances", "token_ids", "price_to_beat",
-         "current_btc_price", "last_update", "market_context"}
+        {
+            "hourly_market",
+            "balances",
+            "balances_by_model",
+            "onchain_cash_by_model",
+            "position_details_by_model",
+            "token_ids",
+            "price_to_beat",
+            "current_btc_price",
+            "last_update",
+            "market_context",
+        }
     )
 
     def __getitem__(self, key: str) -> Any:
@@ -170,6 +201,19 @@ def cleanup_handler(signum, frame):
 # data_prefetch_thread is imported from pm_agent.runner.prefetch
 
 def _validate_ai_keys(s: Settings, ai_providers: list[str]) -> None:
+    def _gemini_requires_api_key(base_url: str | None) -> bool:
+        lowered = (base_url or "").strip().lower()
+        if not lowered:
+            return True
+        # Native Google Gemini endpoints require API key auth.
+        if "generativelanguage.googleapis.com" in lowered:
+            return True
+        if "googleapis.com" in lowered and "generatecontent" in lowered:
+            return True
+        # Third-party/local OpenAI-compatible Gemini gateways may handle
+        # auth upstream and can run without GEMINI_API_KEY.
+        return False
+
     missing_keys: list[str] = []
     missing_url: list[str] = []
     for provider_name in ai_providers:
@@ -178,7 +222,11 @@ def _validate_ai_keys(s: Settings, ai_providers: list[str]) -> None:
             missing_keys.append(provider_name)
         elif provider == "deepseek" and not s.deepseek_api_key:
             missing_keys.append(provider_name)
-        elif provider == "gemini" and not s.gemini_api_key:
+        elif (
+            provider == "gemini"
+            and not s.gemini_api_key
+            and _gemini_requires_api_key(s.gemini_base_url)
+        ):
             missing_keys.append(provider_name)
         elif provider == "claude" and not s.claude_api_key:
             missing_keys.append(provider_name)
@@ -207,7 +255,11 @@ def _validate_ai_keys(s: Settings, ai_providers: list[str]) -> None:
         )
 
 
-def _build_ai_client_and_display(s: Settings, provider: str) -> tuple[AIClient, str]:
+def _build_ai_client_and_display(
+    s: Settings,
+    provider: str,
+    model_override: str | None = None,
+) -> tuple[AIClient, str]:
     if provider == "deepseek":
         return (
             AIClient(
@@ -242,15 +294,16 @@ def _build_ai_client_and_display(s: Settings, provider: str) -> tuple[AIClient, 
             f"Claude ({s.claude_model})",
         )
     if provider == "qwen":
+        qwen_model = (model_override or s.qwen_model).strip()
         return (
             AIClient(
                 api_key=s.qwen_api_key,
-                model=s.qwen_model,
+                model=qwen_model,
                 base_url=s.qwen_base_url,
                 timeout_s=120,
                 provider=provider,
             ),
-            f"Qwen ({s.qwen_model})",
+            f"Qwen ({qwen_model})",
         )
     if provider == "grok":
         return (
@@ -293,6 +346,8 @@ def _build_ai_client_and_display(s: Settings, provider: str) -> tuple[AIClient, 
             base_url=s.openai_base_url or None,
             timeout_s=120,
             provider="openai",
+            reasoning_effort=s.openai_reasoning_effort,
+            force_stream=s.openai_stream,
         ),
         f"OpenAI ({s.openai_model})",
     )
@@ -316,6 +371,73 @@ def main():
     s = load_settings()
     ai_providers = [p.lower() for p in s.get_ai_providers()]
     _validate_ai_keys(s, ai_providers)
+    provider_configs: list[tuple[str, str | None]] = []
+    for provider in ai_providers:
+        if provider == "qwen":
+            # Allow running multiple Qwen models with one provider entry:
+            # QWEN_MODEL=model_a,model_b,model_c
+            qwen_models = [m.strip() for m in (s.qwen_model or "").split(",") if m.strip()]
+            if qwen_models:
+                for qwen_model in qwen_models:
+                    provider_configs.append((provider, qwen_model))
+            else:
+                provider_configs.append((provider, None))
+        else:
+            provider_configs.append((provider, None))
+
+    def _provider_model_label(provider_name: str, model_override: str | None) -> str:
+        p = provider_name.lower().strip()
+        if p == "qwen":
+            model_name = (model_override or s.qwen_model).strip()
+        elif p == "gemini":
+            model_name = (s.gemini_model or "").strip()
+        elif p == "openai":
+            model_name = (s.openai_model or "").strip()
+        elif p == "deepseek":
+            model_name = (s.deepseek_model or "").strip()
+        elif p == "claude":
+            model_name = (s.claude_model or "").strip()
+        elif p == "grok":
+            model_name = (s.grok_model or "").strip()
+        elif p == "glm":
+            model_name = (s.glm_model or "").strip()
+        elif p == "custom":
+            model_name = (s.custom_model or "").strip()
+        else:
+            model_name = ""
+        return f"{provider_name}:{model_name or '-'}"
+
+    model_slots = [_provider_model_label(p, m) for p, m in provider_configs]
+    private_keys = s.get_private_keys()
+    if len(private_keys) != len(model_slots):
+        raise SystemExit(
+            "POLYMARKET_PRIVATE_KEYS must provide exactly one private key per running model. "
+            f"models={len(model_slots)} ({', '.join(model_slots)}), "
+            f"keys={len(private_keys)}. "
+            "Set POLYMARKET_PRIVATE_KEYS in model order."
+        )
+    normalized_private_keys = [k.strip().lower() for k in private_keys]
+    if len(set(normalized_private_keys)) != len(normalized_private_keys):
+        raise SystemExit(
+            "POLYMARKET_PRIVATE_KEYS contains duplicate keys. "
+            "Each running model must use a unique private key."
+        )
+
+    raw_funders = s.get_funders()
+    model_funders: list[str | None]
+    if len(raw_funders) > 1:
+        if len(raw_funders) != len(model_slots):
+            raise SystemExit(
+                "POLYMARKET_FUNDERS must provide exactly one funder per running model "
+                "when multiple funders are configured. "
+                f"models={len(model_slots)} ({', '.join(model_slots)}), "
+                f"funders={len(raw_funders)}."
+            )
+        model_funders = [f.strip() or None for f in raw_funders]
+    elif len(raw_funders) == 1:
+        model_funders = [raw_funders[0].strip() or None for _ in model_slots]
+    else:
+        model_funders = [None for _ in model_slots]
 
     db = SQLiteDB(db_path=s.get_db_path())
 
@@ -325,10 +447,13 @@ def main():
         api_key=s.polymarket_api_key,
         api_secret=s.polymarket_api_secret,
         api_passphrase=s.polymarket_api_passphrase,
-        private_key=s.polymarket_private_key,
+        builder_api_key=s.polymarket_builder_api_key,
+        builder_api_secret=s.polymarket_builder_secret,
+        builder_api_passphrase=s.polymarket_builder_passphrase,
+        private_key=private_keys[0],
         wallet_type=s.polymarket_wallet_type,
         signature_type=s.polymarket_signature_type,
-        funder=s.polymarket_funder,
+        funder=model_funders[0],
         relayer_url=s.polymarket_relayer_url,
     )
     ohlcv = OHLCVSource()
@@ -336,32 +461,11 @@ def main():
     global _ohlcv_source
     _ohlcv_source = ohlcv
 
-    start_background_server()
-
-    if not getattr(sys, "frozen", False):
-
-        def open_browser():
-            time.sleep(2)
-            webbrowser.open("http://localhost:8000")
-
-        threading.Thread(target=open_browser, daemon=True).start()
-
-    private_keys = s.get_private_keys()
-    if private_keys and len(private_keys) < len(ai_providers):
-        logger.warning(
-            "Private keys (%s) < models (%s). Reusing first private key for all models - "
-            "profits will NOT be isolated!",
-            len(private_keys),
-            len(ai_providers),
-        )
-
     models_config: list[dict[str, Any]] = []
-    for idx, provider in enumerate(ai_providers):
-        model_private_key = (
-            private_keys[idx]
-            if idx < len(private_keys)
-            else (private_keys[0] if private_keys else s.polymarket_private_key)
-        )
+    assigned_wallet_keys: list[str] = []
+    model_id_counts: dict[str, int] = {}
+    for idx, (provider, model_override) in enumerate(provider_configs):
+        model_private_key = private_keys[idx]
 
         model_pm = PolymarketClient(
             host=s.polymarket_host,
@@ -369,16 +473,30 @@ def main():
             api_key=s.polymarket_api_key,
             api_secret=s.polymarket_api_secret,
             api_passphrase=s.polymarket_api_passphrase,
+            builder_api_key=s.polymarket_builder_api_key,
+            builder_api_secret=s.polymarket_builder_secret,
+            builder_api_passphrase=s.polymarket_builder_passphrase,
             private_key=model_private_key,
             wallet_type=s.polymarket_wallet_type,
             signature_type=s.polymarket_signature_type,
-            funder=s.polymarket_funder,
+            funder=model_funders[idx],
             relayer_url=s.polymarket_relayer_url,
         )
+        assigned_wallet_keys.append((model_private_key or "").strip().lower())
 
-        ai, display_name = _build_ai_client_and_display(s, provider)
-        model_id = f"{provider}-{ai.model}"
-        orchestrator = StrategyOrchestrator(mode=s.mode, symbol=s.symbol, ohlcv=ohlcv, ai=ai)
+        ai, display_name = _build_ai_client_and_display(s, provider, model_override=model_override)
+        base_model_id = f"{provider}-{ai.model}"
+        duplicate_idx = model_id_counts.get(base_model_id, 0) + 1
+        model_id_counts[base_model_id] = duplicate_idx
+        model_id = base_model_id if duplicate_idx == 1 else f"{base_model_id}-{duplicate_idx}"
+        if duplicate_idx > 1:
+            logger.warning(
+                "Duplicate provider/model detected (%s). Assigned unique model_id=%s for isolation.",
+                base_model_id,
+                model_id,
+            )
+        display_name_instance = display_name if duplicate_idx == 1 else f"{display_name} #{duplicate_idx}"
+        orchestrator = StrategyOrchestrator(symbol=s.symbol, ohlcv=ohlcv, ai=ai)
         provider_sim_mode = s.get_provider_simulation_mode(provider)
         engine = ExecutionEngine(
             pm=model_pm,
@@ -391,6 +509,7 @@ def main():
             ),
             simulation_mode=provider_sim_mode,
             model_id=model_id,
+            order_type=s.order_type,
         )
 
         db.init_account_balance(model_id, s.initial_balance_usd)
@@ -415,7 +534,7 @@ def main():
             {
                 "provider": provider,
                 "model_id": model_id,
-                "display_name": display_name,
+                "display_name": display_name_instance,
                 "orchestrator": orchestrator,
                 "engine": engine,
                 "pm_client": model_pm,
@@ -423,12 +542,38 @@ def main():
             }
         )
         sim_label = "[SIM]" if provider_sim_mode else "[LIVE]"
-        logger.info("  %s %s initialized (model_id=%s)", sim_label, display_name, model_id)
+        logger.info("  %s %s initialized (model_id=%s)", sim_label, display_name_instance, model_id)
 
     if not models_config:
         raise SystemExit("No model initialized.")
 
-    set_runtime_models([m["model_id"] for m in models_config])
+    # Enable on-chain balance injection only for live models that have a unique wallet key.
+    # Models sharing one wallet will use per-model trade ledger only to avoid cross-contaminated
+    # positions/P&L in runtime accounting and prompts.
+    live_key_counts: dict[str, int] = {}
+    for i, model_cfg in enumerate(models_config):
+        if model_cfg.get("simulation_mode", s.simulation_mode):
+            continue
+        key = assigned_wallet_keys[i]
+        if key:
+            live_key_counts[key] = live_key_counts.get(key, 0) + 1
+
+    duplicate_wallet_models: list[str] = []
+    for i, model_cfg in enumerate(models_config):
+        msim = model_cfg.get("simulation_mode", s.simulation_mode)
+        key = assigned_wallet_keys[i]
+        use_actual_balances = (not msim) and bool(key) and live_key_counts.get(key, 0) == 1
+        model_cfg["use_actual_balances"] = use_actual_balances
+        if not msim and key and live_key_counts.get(key, 0) > 1:
+            duplicate_wallet_models.append(model_cfg["model_id"])
+
+    if duplicate_wallet_models:
+        logger.warning(
+            "Detected shared live wallet across models (%s). Disabled per-model on-chain balance "
+            "injection for these models to avoid position/P&L cross-contamination. "
+            "Use POLYMARKET_PRIVATE_KEYS with one unique key per live model for true isolation.",
+            duplicate_wallet_models,
+        )
 
     logger.info(
         "🏁 Multi-Model Arena: %d models competing: %s",
@@ -445,7 +590,25 @@ def main():
     else:
         set_ai_model_info("multi", f"{len(models_config)} models")
 
-    model_pm_clients = {m["model_id"]: m["pm_client"] for m in models_config}
+    decision_executor: ThreadPoolExecutor | None = None
+    if s.model_parallel and len(models_config) > 1:
+        desired_workers = s.model_max_workers if s.model_max_workers > 0 else len(models_config)
+        max_workers = max(1, min(len(models_config), desired_workers))
+        if max_workers > 1:
+            decision_executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="pm-model",
+            )
+            logger.info("Model decision execution mode: parallel (%d workers)", max_workers)
+        else:
+            logger.info("Model decision execution mode: serial (MODEL_MAX_WORKERS=1)")
+    else:
+        logger.info("Model decision execution mode: serial")
+
+    live_model_ids = [
+        m["model_id"] for m in models_config if not m.get("simulation_mode", s.simulation_mode)
+    ]
+    model_pm_clients = {m["model_id"]: m["pm_client"] for m in models_config if m["model_id"] in live_model_ids}
     prefetch_thread = threading.Thread(
         target=data_prefetch_thread,
         kwargs=dict(
@@ -455,6 +618,7 @@ def main():
             s=s,
             db=db,
             model_pm_clients=model_pm_clients,
+            live_model_ids=live_model_ids,
             cache=_market_cache,
             cache_lock=cache_lock,
             stop_event=_stop_event,
@@ -473,7 +637,6 @@ def main():
         time.sleep(1)
 
     logger.info("Agent running in logger mode")
-    logger.info("提示：使用 'python -m pm_agent.live_stats' 启动实时统计仪表盘")
 
     last_ai_end_time = 0.0
     last_auto_redeem_ts = 0.0
@@ -497,6 +660,24 @@ def main():
             with cache_lock:
                 hourly = dict(cached_data.get("hourly_market") or {})
                 balances = dict(cached_data.get("balances") or {})
+                raw_balances_by_model = cached_data.get("balances_by_model") or {}
+                balances_by_model = (
+                    {str(mid): dict(vals or {}) for mid, vals in raw_balances_by_model.items()}
+                    if isinstance(raw_balances_by_model, dict)
+                    else {}
+                )
+                raw_position_details_by_model = cached_data.get("position_details_by_model") or {}
+                position_details_by_model = (
+                    {
+                        str(mid): {
+                            str(tid): dict(detail or {})
+                            for tid, detail in (details or {}).items()
+                        }
+                        for mid, details in raw_position_details_by_model.items()
+                    }
+                    if isinstance(raw_position_details_by_model, dict)
+                    else {}
+                )
                 price_to_beat = cached_data.get("price_to_beat")
                 current_btc_price = cached_data.get("current_btc_price")
                 data_age = (
@@ -548,18 +729,30 @@ def main():
             for model_cfg in models_config:
                 mid = model_cfg["model_id"]
                 msim = model_cfg.get("simulation_mode", s.simulation_mode)
+                use_actual_balances = bool(
+                    model_cfg.get("use_actual_balances", (not msim))
+                )
+                model_balances = balances_by_model.get(mid) or balances
+                model_position_details = position_details_by_model.get(mid) or {}
+                model_actual_avg_prices = {
+                    str(tid): _safe_float((detail or {}).get("avg_price"), default=0.0)
+                    for tid, detail in model_position_details.items()
+                }
                 mdp = db.get_positions(
                     token_ids,
-                    actual_balances=(balances if (token_ids and not msim) else None),
+                    actual_balances=(model_balances if (token_ids and use_actual_balances) else None),
+                    actual_avg_prices=(
+                        model_actual_avg_prices if (token_ids and use_actual_balances) else None
+                    ),
                     model_id=mid,
                 )
                 up_shares_m = _safe_float(
-                    (balances.get(up_id) if (not msim and up_id) else None)
+                    (model_balances.get(up_id) if (use_actual_balances and up_id) else None)
                     or (mdp.get(up_id) or {}).get("shares"),
                     default=0.0,
                 )
                 down_shares_m = _safe_float(
-                    (balances.get(down_id) if (not msim and down_id) else None)
+                    (model_balances.get(down_id) if (use_actual_balances and down_id) else None)
                     or (mdp.get(down_id) or {}).get("shares"),
                     default=0.0,
                 )
@@ -578,9 +771,6 @@ def main():
             up_best_ask = _safe_float((hourly.get("up") or {}).get("best_ask"), default=0.0)
             down_best_bid = _safe_float((hourly.get("down") or {}).get("best_bid"), default=0.0)
             down_best_ask = _safe_float((hourly.get("down") or {}).get("best_ask"), default=0.0)
-
-            up_avg_cost = _safe_float((db_positions.get(up_id) or {}).get("avg_price"), default=0.0)
-            down_avg_cost = _safe_float((db_positions.get(down_id) or {}).get("avg_price"), default=0.0)
 
             slug = hourly.get("slug") or "Unknown"
             end_time_utc_str = hourly.get("end_time_utc")
@@ -674,28 +864,62 @@ def main():
             cycle_id = str(uuid.uuid4())
 
             # ── Run each model's decision loop (fully isolated) ──
-            for model_cfg in models_config:
-                try:
-                    result = _call_model_decision(model_cfg)
-                    if result.get("status") == "error":
+            if decision_executor is None:
+                for model_cfg in models_config:
+                    try:
+                        result = _call_model_decision(model_cfg)
+                        if result.get("status") == "error":
+                            logger.error(
+                                "[%s] model run failed: %s",
+                                model_cfg["display_name"],
+                                result.get("error"),
+                            )
+                    except Exception as exc:
                         logger.error(
-                            "[%s] model run failed: %s",
-                            model_cfg["display_name"],
-                            result.get("error"),
+                            "[%s] model run failed: %s", model_cfg["display_name"], exc, exc_info=True
                         )
-                except Exception as exc:
-                    logger.error(
-                        "[%s] model run failed: %s", model_cfg["display_name"], exc, exc_info=True
-                    )
+            else:
+                futures = {
+                    decision_executor.submit(_call_model_decision, model_cfg): model_cfg
+                    for model_cfg in models_config
+                }
+                for future in as_completed(futures):
+                    model_cfg = futures[future]
+                    try:
+                        result = future.result()
+                        if result.get("status") == "error":
+                            logger.error(
+                                "[%s] model run failed: %s",
+                                model_cfg["display_name"],
+                                result.get("error"),
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "[%s] model run failed: %s", model_cfg["display_name"], exc, exc_info=True
+                        )
 
             # Cycle-end snapshot updates for each model.
             for model_cfg in models_config:
                 try:
                     model_id = model_cfg["model_id"]
                     msim = model_cfg.get("simulation_mode", s.simulation_mode)
+                    use_actual_balances = bool(
+                        model_cfg.get("use_actual_balances", (not msim))
+                    )
+                    model_balances = balances_by_model.get(model_id) or balances
+                    model_position_details = position_details_by_model.get(model_id) or {}
+                    model_actual_avg_prices = {
+                        str(tid): _safe_float((detail or {}).get("avg_price"), default=0.0)
+                        for tid, detail in model_position_details.items()
+                    }
                     model_positions = db.get_positions(
                         token_ids,
-                        actual_balances=(balances if (token_ids and not msim) else None),
+                        actual_balances=(
+                            model_balances if (token_ids and use_actual_balances) else None
+                        ),
+                        actual_avg_prices=(
+                            model_actual_avg_prices if (token_ids and use_actual_balances) else None
+                        ),
                         model_id=model_id,
                     )
                     total_position_value = 0.0
@@ -741,6 +965,8 @@ def main():
         logger.error("Fatal main loop error: %s\n%s", e, traceback.format_exc())
         raise
     finally:
+        if decision_executor is not None:
+            decision_executor.shutdown(wait=False, cancel_futures=True)
         try:
             if _ohlcv_source is not None:
                 _ohlcv_source.close()

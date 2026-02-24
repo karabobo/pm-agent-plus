@@ -24,7 +24,6 @@ def _to_float(v: Any, default: float = 0.0) -> float:
 
 @dataclass
 class StrategyOrchestrator:
-    mode: str
     symbol: str
     ohlcv: OHLCVSource
     ai: AIClient
@@ -128,7 +127,6 @@ class StrategyOrchestrator:
                 f" Risk limits: max_notional_usd={max_notional}, "
                 f"max_position_usd={max_position}."
             )
-
         sys_cfg = SystemPromptConfig(
             role_definition=(
                 "You are a professional Polymarket crypto trader focused on BTC hourly "
@@ -136,7 +134,6 @@ class StrategyOrchestrator:
                 "session - you decide whether to scalp, swing, or hold to settlement!"
                 + limit_text
             ),
-            mode=self.mode,
             trade_frequency=(
                 "Evaluate each cycle and decide your trading style. You can:\n"
                 "- SCALP: Quick in-and-out trades (minutes)\n"
@@ -252,6 +249,11 @@ class StrategyOrchestrator:
     def run_once(self, cycle_id: str, context: dict[str, Any]) -> ParsedDecision:
         indicators_snapshot = self.compute_indicators_snapshot()
         system_prompt, user_prompt = self.build_prompts(cycle_id, context, indicators_snapshot)
+        logger.info(
+            "Prompt sizes: system=%d chars, user=%d chars",
+            len(system_prompt),
+            len(user_prompt),
+        )
         raw = self.ai.call_with_messages(system_prompt, user_prompt)
         parsed = parse_full_decision_response(raw)
         parsed.prompt = user_prompt

@@ -6,9 +6,10 @@ from dataclasses import dataclass, field
 @dataclass
 class SystemPromptConfig:
     role_definition: str = (
-        "You are an execution-focused trading decision engine for Polymarket BTC hourly round markets."
+        "You are an execution-only quantitative trader for Polymarket BTC hourly markets. "
+        "You are not a financial analyst; your job is to produce disciplined, tradeable actions "
+        "under hard risk limits."
     )
-    mode: str = "conservative"
     trade_frequency: str = "Make one decision per cycle and avoid overtrading."
     entry_standards: str = (
         "Only open positions when indicators and market context agree; otherwise wait."
@@ -32,13 +33,18 @@ class SystemPromptConfig:
 
 def build_system_prompt(cfg: SystemPromptConfig) -> str:
     hard = "\n".join(f"- {x}" for x in cfg.hard_constraints)
+    output_schema = (
+        '{"actions":[{"type":"close|open|hold|wait","market":"...","token_id":"...",'
+        '"side":"buy_up|sell_up|buy_down|sell_down","price":0.5,"size":10,"amount":5.0,'
+        '"time_in_force":"GTC|IOC","risk":{"max_slippage_bps":30,'
+        '"max_notional_usd":200},"rationale":"..."}]}'
+    )
+
     return f"""You are an execution-focused trading decision engine for Polymarket BTC hourly round markets.
 
 <role>
 {cfg.role_definition}
 </role>
-
-<trading_mode>{cfg.mode}</trading_mode>
 
 <trade_frequency>
 {cfg.trade_frequency}
@@ -59,7 +65,7 @@ def build_system_prompt(cfg: SystemPromptConfig) -> str:
 <output_format>
 Return EXACTLY:
 <reasoning>...</reasoning>
-<decision>{{"actions":[{{"type":"close|open|hold|wait","market":"...","token_id":"...","side":"buy_up|sell_up|buy_down|sell_down","price":0.5,"size":10,"amount":5.0,"time_in_force":"GTC|IOC","risk":{{"max_slippage_bps":30,"max_notional_usd":200}},"rationale":"..."}}]}}</decision>
+<decision>{output_schema}</decision>
 </output_format>
 
 <position_and_order_rules>

@@ -21,6 +21,7 @@ class ExecutionEngine:
     limits: RiskLimits
     simulation_mode: bool = False
     model_id: str = "default"
+    order_type: str | None = None
 
     def _sort_actions(self, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return sorted(actions or [], key=lambda a: PRIORITY.get(str(a.get("type", "wait")), 99))
@@ -41,6 +42,18 @@ class ExecutionEngine:
             )
 
         for a in actions:
+            action_type = str((a or {}).get("type", "")).lower()
+            if action_type in ("hold", "wait"):
+                res = {"action": a, "status": "skipped"}
+                results.append(res)
+                self.db.log(
+                    ts=iso(utcnow()),
+                    type_="action_skip",
+                    payload_json=json.dumps(res, ensure_ascii=False),
+                    model_id=self.model_id,
+                )
+                continue
+
             try:
                 a2 = enforce_action(a, self.limits)
             except RiskError as e:
@@ -49,17 +62,6 @@ class ExecutionEngine:
                 self.db.log(
                     ts=iso(utcnow()),
                     type_="risk_reject",
-                    payload_json=json.dumps(res, ensure_ascii=False),
-                    model_id=self.model_id,
-                )
-                continue
-
-            if a2.get("type") in ("hold", "wait"):
-                res = {"action": a2, "status": "skipped"}
-                results.append(res)
-                self.db.log(
-                    ts=iso(utcnow()),
-                    type_="action_skip",
                     payload_json=json.dumps(res, ensure_ascii=False),
                     model_id=self.model_id,
                 )
@@ -121,12 +123,24 @@ class ExecutionEngine:
                 continue
 
             is_buy = side.startswith("buy_")
+            pre_sell_avg_cost = 0.0
+            if not is_buy:
+                try:
+                    pos_for_pnl = self.db.get_positions([str(token_id)], model_id=self.model_id)
+                    pre_sell_avg_cost = float(
+                        (pos_for_pnl.get(str(token_id), {}) or {}).get("avg_price", 0.0) or 0.0
+                    )
+                except Exception:
+                    pre_sell_avg_cost = 0.0
+
             if is_buy:
                 ai_amount = a2.get("amount")
                 if ai_amount is not None and ai_amount > 0:
-                    amount = ai_amount
+                    amount = float(ai_amount)
                 else:
-                    amount = price * size
+                    amount = float(price * size)
+                # Most CLOB venues require quote notional precision to 2 decimals.
+                amount = round(amount, 2)
             else:
                 if self.simulation_mode:
                     db_positions = self.db.get_positions([str(token_id)], model_id=self.model_id)
@@ -188,8 +202,43 @@ class ExecutionEngine:
                             e,
                         )
 
-                amount = size
+                amount = float(size)
 
+            # Hard cap per-side position value after this action.
+            if is_buy and a2.get("type") == "open":
+                try:
+                    token_id_str = str(token_id)
+                    pos_map = self.db.get_positions([token_id_str], model_id=self.model_id)
+                    pos = pos_map.get(token_id_str, {})
+                    held_shares = float(pos.get("shares", 0.0) or 0.0)
+                    held_avg_price = float(pos.get("avg_price", 0.0) or 0.0)
+                    mark_price = float(price) if float(price) > 0 else held_avg_price
+                    current_position_value = held_shares * max(mark_price, 0.0)
+                    projected_position_value = current_position_value + float(amount)
+                    if projected_position_value > float(self.limits.max_position_usd):
+                        res = {
+                            "action": a2,
+                            "status": "rejected_risk",
+                            "error": (
+                                f"projected position {projected_position_value:.2f} exceeds "
+                                f"max_position_usd {self.limits.max_position_usd:.2f}"
+                            ),
+                        }
+                        results.append(res)
+                        self.db.log(
+                            ts=iso(utcnow()),
+                            type_="risk_reject",
+                            payload_json=json.dumps(res, ensure_ascii=False),
+                            model_id=self.model_id,
+                        )
+                        continue
+                except Exception as pos_cap_error:
+                    logger.warning(
+                        "[%s] max_position check failed for %s: %s",
+                        self.model_id,
+                        token_id,
+                        pos_cap_error,
+                    )
 
             logger.info(
                 "%s Submitting market order side=%s token_id=%s amount=%s price=%s size=%s",
@@ -208,7 +257,7 @@ class ExecutionEngine:
                 realized_pnl_change = 0
                 if not is_buy:
                     positions = self.db.get_positions([token_id], model_id=self.model_id)
-                    avg_cost = positions.get(token_id, {}).get("avg_cost", 0)
+                    avg_cost = positions.get(token_id, {}).get("avg_price", 0)
 
                 self.db.record_trade(
                     ts=iso(utcnow()),
@@ -270,6 +319,7 @@ class ExecutionEngine:
                         side=("BUY" if is_buy else "SELL"),
                         token_id=str(token_id),
                         amount=float(amount),
+                        order_type=self.order_type,
                     )
                     if order and isinstance(order, dict):
                         if order.get("error") or order.get("status") == "error":
@@ -345,6 +395,20 @@ class ExecutionEngine:
                     order=order if isinstance(order, dict) else {"raw": str(order)},
                     model_id=self.model_id,
                     is_simulation=False,
+                )
+                cash_change = -(float(filled) * float(avg_price)) if is_buy else (
+                    float(filled) * float(avg_price)
+                )
+                realized_pnl_change = (
+                    0.0
+                    if is_buy
+                    else (float(avg_price) - float(pre_sell_avg_cost)) * float(filled)
+                )
+                self.db.update_account_balance(
+                    model_id=self.model_id,
+                    cash_change=cash_change,
+                    realized_pnl_change=realized_pnl_change,
+                    skip_snapshot=True,
                 )
 
         return results

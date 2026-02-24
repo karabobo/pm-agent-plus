@@ -41,6 +41,7 @@ def data_prefetch_thread(
     s: Settings,
     db: SQLiteDB,
     model_pm_clients: dict[str, PolymarketClient] | None = None,
+    live_model_ids: list[str] | None = None,
     *,
     cache: Any,           # MarketCache instance
     cache_lock: threading.Lock,
@@ -60,6 +61,18 @@ def data_prefetch_thread(
     first_run = True
     startup_cleanup_done = False
     error_count = 0
+    onchain_cash_by_model: dict[str, float] = {}
+    onchain_position_details_by_model: dict[str, dict[str, dict[str, float]]] = {}
+    last_cash_sync_ts = 0.0
+    reconciliation_sync_interval = max(
+        2,
+        int(getattr(s, "reconciliation_sync_interval_sec", 5) or 5),
+    )
+    live_model_id_set = {str(mid) for mid in (live_model_ids or []) if str(mid)}
+    if live_model_ids is None:
+        has_live_models = not s.simulation_mode
+    else:
+        has_live_models = bool(live_model_id_set)
 
     while not stop_event.is_set():
         try:
@@ -117,7 +130,7 @@ def data_prefetch_thread(
                             if cached_price_to_beat is not None
                             else None
                         ),
-                        simulation_mode=s.simulation_mode,
+                        simulation_mode=(not has_live_models),
                         model_pm_clients=model_pm_clients,
                         auto_redeem_use_relayer=s.auto_redeem_use_relayer,
                     )
@@ -169,7 +182,19 @@ def data_prefetch_thread(
                     startup_cleanup_done = True
                     if current_token_ids:
                         try:
-                            startup_cleanup_stale_positions(db, current_token_ids, s.simulation_mode)
+                            # In mixed mode, never force simulation cleanup globally.
+                            if has_live_models:
+                                startup_cleanup_stale_positions(
+                                    db,
+                                    current_token_ids,
+                                    False,
+                                )
+                            else:
+                                startup_cleanup_stale_positions(
+                                    db,
+                                    current_token_ids,
+                                    s.simulation_mode,
+                                )
                         except Exception as cleanup_error:
                             logger.error("Startup cleanup failed: %s", cleanup_error)
 
@@ -188,8 +213,6 @@ def data_prefetch_thread(
                     cache["token_ids"] = current_token_ids
                     cache["price_to_beat"] = price_to_beat
 
-                # Push fresh market data to the dashboard server.
-                _push_market_prices_to_server(cache, cache_lock, hourly, up_id, down_id)
 
             # Re-read to get current token IDs for orderbook refresh.
             with cache_lock:
@@ -214,14 +237,71 @@ def data_prefetch_thread(
 
                 up_id = hourly.get("up_token_id")
                 down_id = hourly.get("down_token_id")
-                _push_market_prices_to_server(cache, cache_lock, hourly, up_id, down_id)
 
-                balances: dict[str, float] = (
-                    {} if s.simulation_mode else pm.get_token_balances(current_token_ids)
-                )
+                balances: dict[str, float] = {}
+                balances_by_model: dict[str, dict[str, float]] = {}
+                if has_live_models:
+                    balances = pm.get_token_balances(current_token_ids)
+                    if model_pm_clients:
+                        for mid, model_pm in model_pm_clients.items():
+                            if live_model_id_set and str(mid) not in live_model_id_set:
+                                continue
+                            try:
+                                balances_by_model[str(mid)] = model_pm.get_token_balances(
+                                    current_token_ids
+                                )
+                            except Exception as bal_error:
+                                logger.warning("[%s] get_token_balances failed: %s", mid, bal_error)
+                                balances_by_model[str(mid)] = {}
+
+                        now_ts = time.time()
+                        # Keep on-chain reconciliation separate from account_balances.
+                        if now_ts - last_cash_sync_ts >= reconciliation_sync_interval:
+                            latest_cash: dict[str, float] = {}
+                            latest_position_details: dict[str, dict[str, dict[str, float]]] = {}
+                            for mid, model_pm in model_pm_clients.items():
+                                try:
+                                    latest_cash[str(mid)] = float(model_pm.get_account_balance())
+                                except Exception as cash_error:
+                                    logger.warning("[%s] get_account_balance failed: %s", mid, cash_error)
+                                try:
+                                    rows = model_pm.get_positions(
+                                        redeemable_only=False,
+                                        size_threshold=0.0,
+                                    )
+                                    details: dict[str, dict[str, float]] = {}
+                                    for row in (rows or []):
+                                        token_id = str(row.get("asset") or "").strip()
+                                        if not token_id or token_id not in current_token_ids:
+                                            continue
+                                        shares = safe_float(row.get("size"), default=0.0)
+                                        if shares <= 0:
+                                            continue
+                                        avg_price = max(
+                                            0.0,
+                                            safe_float(row.get("avgPrice"), default=0.0),
+                                        )
+                                        details[token_id] = {
+                                            "shares": shares,
+                                            "avg_price": avg_price,
+                                        }
+                                    latest_position_details[str(mid)] = details
+                                except Exception as pos_error:
+                                    logger.warning("[%s] get_positions failed: %s", mid, pos_error)
+                                    latest_position_details[str(mid)] = {}
+                            if latest_cash:
+                                onchain_cash_by_model = latest_cash
+                            if latest_position_details:
+                                onchain_position_details_by_model = latest_position_details
+                            last_cash_sync_ts = now_ts
+
                 with cache_lock:
                     cache["balances"] = balances
+                    cache["balances_by_model"] = balances_by_model
+                    cache["onchain_cash_by_model"] = onchain_cash_by_model
+                    cache["position_details_by_model"] = onchain_position_details_by_model
                     cache["last_update"] = time.time()
+
 
             error_count = 0
             time.sleep(1)
@@ -238,35 +318,3 @@ def data_prefetch_thread(
             else:
                 logger.error("Data prefetch error: %s", e, exc_info=True)
             time.sleep(wait_time)
-
-
-def _push_market_prices_to_server(
-    cache: Any,
-    cache_lock: threading.Lock,
-    hourly: dict,
-    up_id: str | None,
-    down_id: str | None,
-) -> None:
-    """Push the latest market prices to the FastAPI dashboard cache."""
-    try:
-        from pm_agent.server import update_market_prices
-
-        with cache_lock:
-            ptb = cache.get("price_to_beat")
-            cbtc = cache.get("current_btc_price")
-
-        update_market_prices(
-            up_bid=(hourly.get("up") or {}).get("best_bid"),
-            up_ask=(hourly.get("up") or {}).get("best_ask"),
-            down_bid=(hourly.get("down") or {}).get("best_bid"),
-            down_ask=(hourly.get("down") or {}).get("best_ask"),
-            slug=hourly.get("slug"),
-            title=(hourly.get("market") or {}).get("question"),
-            end_time=hourly.get("end_time_utc"),
-            price_to_beat=ptb,
-            current_btc_price=cbtc,
-            up_token_id=up_id,
-            down_token_id=down_id,
-        )
-    except Exception as e:
-        logger.warning("Failed to update server price cache: %s", e)

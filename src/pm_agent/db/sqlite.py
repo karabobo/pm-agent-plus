@@ -5,6 +5,9 @@ from typing import Any
 import sqlite3
 from pathlib import Path
 import json
+import datetime as dt
+import math
+import statistics
 
 
 @dataclass
@@ -169,13 +172,25 @@ class SQLiteDB:
         self,
         token_ids: list[str],
         actual_balances: dict[str, float] | None = None,
+        actual_avg_prices: dict[str, float] | None = None,
         model_id: str = "default",
     ) -> dict[str, dict[str, float]]:
         positions = self._calculate_positions_from_trades(token_ids, model_id)
         if actual_balances is not None:
             for tid in token_ids:
                 p = positions.setdefault(tid, {"shares": 0.0, "avg_price": 0.0})
-                p["shares"] = float(actual_balances.get(tid, p.get("shares", 0.0)) or 0.0)
+                chain_shares = float(actual_balances.get(tid, p.get("shares", 0.0)) or 0.0)
+                p["shares"] = chain_shares
+                if chain_shares <= 1e-9:
+                    p["avg_price"] = 0.0
+                    continue
+                if actual_avg_prices is not None and tid in actual_avg_prices:
+                    try:
+                        chain_avg = float(actual_avg_prices.get(tid, p.get("avg_price", 0.0)) or 0.0)
+                        if chain_avg >= 0:
+                            p["avg_price"] = chain_avg
+                    except Exception:
+                        pass
         return positions
 
     def _calculate_positions_from_trades(
@@ -265,8 +280,98 @@ class SQLiteDB:
             "realized_pnl": realized_pnl,
         }
 
+    def get_sharpe_stats(self, model_id: str = "default", limit: int = 2000) -> dict[str, Any]:
+        """Compute Sharpe stats from account equity snapshots.
+
+        Returns annualized Sharpe (risk-free rate assumed 0) and supporting
+        metadata. If data is insufficient, sharpe values are returned as None.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT total_equity, created_at
+                FROM equity_snapshots
+                WHERE model_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (model_id, int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if len(rows) < 3:
+            return {
+                "sharpe_ratio": None,
+                "sharpe_raw": None,
+                "samples": 0,
+                "median_interval_sec": None,
+            }
+
+        ordered = list(reversed(rows))
+        returns: list[float] = []
+        intervals: list[float] = []
+        prev_equity: float | None = None
+        prev_ts: dt.datetime | None = None
+
+        for r in ordered:
+            equity = float(r["total_equity"] or 0.0)
+            ts_raw = str(r["created_at"] or "").strip()
+            ts: dt.datetime | None = None
+            if ts_raw:
+                try:
+                    ts = dt.datetime.fromisoformat(ts_raw)
+                except Exception:
+                    ts = None
+
+            if prev_equity is not None and prev_equity > 0 and equity > 0:
+                returns.append((equity - prev_equity) / prev_equity)
+            prev_equity = equity
+
+            if prev_ts is not None and ts is not None:
+                delta_sec = (ts - prev_ts).total_seconds()
+                if delta_sec > 0:
+                    intervals.append(delta_sec)
+            prev_ts = ts if ts is not None else prev_ts
+
+        if len(returns) < 2:
+            return {
+                "sharpe_ratio": None,
+                "sharpe_raw": None,
+                "samples": len(returns),
+                "median_interval_sec": statistics.median(intervals) if intervals else None,
+            }
+
+        mean_ret = statistics.fmean(returns)
+        stdev_ret = statistics.stdev(returns)
+        if stdev_ret <= 1e-12:
+            return {
+                "sharpe_ratio": None,
+                "sharpe_raw": None,
+                "samples": len(returns),
+                "median_interval_sec": statistics.median(intervals) if intervals else None,
+            }
+
+        sharpe_raw = mean_ret / stdev_ret
+        median_interval_sec = statistics.median(intervals) if intervals else None
+        annualization = 1.0
+        if median_interval_sec and median_interval_sec > 0:
+            periods_per_year = (365.0 * 24.0 * 3600.0) / median_interval_sec
+            annualization = math.sqrt(max(periods_per_year, 1.0))
+
+        return {
+            "sharpe_ratio": sharpe_raw * annualization,
+            "sharpe_raw": sharpe_raw,
+            "samples": len(returns),
+            "median_interval_sec": median_interval_sec,
+        }
+
     def get_trade_history(
-        self, token_ids: list[str] | None = None, limit: int = 100
+        self,
+        token_ids: list[str] | None = None,
+        limit: int = 100,
+        model_id: str = "default",
     ) -> list[dict[str, Any]]:
         conn = self._connect()
         try:
@@ -275,15 +380,16 @@ class SQLiteDB:
                 rows = conn.execute(
                     f"""
                     SELECT * FROM trades
-                    WHERE token_id IN ({placeholders})
+                    WHERE model_id = ? AND token_id IN ({placeholders})
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    [*token_ids, int(limit)],
+                    [model_id, *token_ids, int(limit)],
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (int(limit),)
+                    "SELECT * FROM trades WHERE model_id = ? ORDER BY id DESC LIMIT ?",
+                    (model_id, int(limit)),
                 ).fetchall()
             out = []
             for r in rows:
@@ -409,6 +515,9 @@ class SQLiteDB:
         position_value: float,
         cash_balance: float,
     ) -> None:
+        snapshot_ts = str(ts or "").strip()
+        if not snapshot_ts:
+            snapshot_ts = dt.datetime.now(dt.timezone.utc).isoformat()
         conn = self._connect()
         try:
             conn.execute(
@@ -418,7 +527,7 @@ class SQLiteDB:
                 """,
                 (
                     model_id,
-                    ts,
+                    snapshot_ts,
                     float(total_equity),
                     float(realized_pnl),
                     float(unrealized_pnl),
@@ -546,8 +655,9 @@ class SQLiteDB:
 
         if not skip_snapshot:
             total_equity = new_cash + new_pos
+            snapshot_ts = dt.datetime.now(dt.timezone.utc).isoformat()
             self.save_equity_snapshot(
-                ts="",
+                ts=snapshot_ts,
                 model_id=model_id,
                 total_equity=total_equity,
                 realized_pnl=new_real,
@@ -565,7 +675,7 @@ class SQLiteDB:
         """
         import datetime as _dt
 
-        today = _dt.date.today().isoformat()  # e.g. "2026-02-23"
+        today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()  # e.g. "2026-02-23"
         conn = self._connect()
         try:
             row = conn.execute(
@@ -581,4 +691,3 @@ class SQLiteDB:
             return int(row["cnt"]) if row else 0
         finally:
             conn.close()
-
