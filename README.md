@@ -1,6 +1,4 @@
-# pm-agent-plus
 
-`pm-agent-plus` is the standalone project extracted from the recovered `pm-agent` source.
 
 ## Structure
 
